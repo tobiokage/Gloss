@@ -1,0 +1,14 @@
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS commission_ledger;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS bill_tip_allocations;
+DROP TABLE IF EXISTS bill_items;
+DROP TABLE IF EXISTS bills;
+DROP TABLE IF EXISTS store_bill_counters;
+DROP TABLE IF EXISTS catalogue_items;
+DROP TABLE IF EXISTS staff_store_mapping;
+DROP TABLE IF EXISTS staff;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS stores;
+DROP TABLE IF EXISTS tenants;
