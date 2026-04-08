@@ -177,21 +177,21 @@ type billingServiceStoredBill struct {
 func newBillingServiceTestState() *billingServiceTestState {
 	return &billingServiceTestState{
 		store: StoreSnapshot{
-			ID:       "store-1",
+			ID:       "33333333-3333-4333-8333-333333333333",
 			TenantID: "tenant-1",
 			Name:     "Main Street Salon",
 			Code:     "MSS",
 			Location: "Downtown",
 		},
 		catalogue: map[string]AuthoritativeCatalogueLine{
-			"cat-1": {
-				CatalogueItemID: "cat-1",
+			"11111111-1111-4111-8111-111111111111": {
+				CatalogueItemID: "11111111-1111-4111-8111-111111111111",
 				ServiceName:     "Haircut",
 				UnitPrice:       10500,
 			},
 		},
 		staff: map[string]AuthoritativeStaffMember{
-			"staff-1": {ID: "staff-1"},
+			"22222222-2222-4222-8222-222222222222": {ID: "22222222-2222-4222-8222-222222222222"},
 		},
 		nextBillSequence: 41,
 		idempotency:      map[string]billingServiceTestIdempotencyRecord{},
@@ -206,7 +206,7 @@ func billingTestAuthContext() auth.AuthContext {
 	return auth.AuthContext{
 		UserID:   "user-1",
 		TenantID: "tenant-1",
-		StoreID:  "store-1",
+		StoreID:  "33333333-3333-4333-8333-333333333333",
 		Role:     string(enums.RoleStoreManager),
 	}
 }
@@ -216,9 +216,9 @@ func billingTestCreateBillRequest(idempotencyKey string) CreateBillRequest {
 		ClientBillRef: "tablet-1",
 		Items: []CreateBillItemRequest{
 			{
-				CatalogueItemID: "cat-1",
+				CatalogueItemID: "11111111-1111-4111-8111-111111111111",
 				Quantity:        1,
-				AssignedStaffID: "staff-1",
+				AssignedStaffID: "22222222-2222-4222-8222-222222222222",
 			},
 		},
 		Payment: CreateBillPaymentRequest{

@@ -48,6 +48,40 @@ func BuildCalculatorInput(
 	}, nil
 }
 
+func BuildCreateBillSuccessResponse(
+	store StoreSnapshot,
+	bill InsertBillInput,
+	items []PersistedBillItem,
+	tipAllocations []InsertTipAllocationInput,
+	payments []InsertPaymentInput,
+) CreateBillResponse {
+	graph := BillGraph{
+		Store: store,
+		Bill: BillRecord{
+			ID:                 bill.ID,
+			BillNumber:         bill.BillNumber,
+			Status:             bill.Status,
+			PaymentModeSummary: bill.PaymentModeSummary,
+			ServiceGrossAmount: bill.ServiceGrossAmount,
+			DiscountAmount:     bill.DiscountAmount,
+			ServiceNetAmount:   bill.ServiceNetAmount,
+			TipAmount:          bill.TipAmount,
+			TaxableBaseAmount:  bill.TaxableBaseAmount,
+			TaxAmount:          bill.TaxAmount,
+			TotalAmount:        bill.TotalAmount,
+			AmountPaid:         bill.AmountPaid,
+			AmountDue:          bill.AmountDue,
+			CreatedAt:          bill.CreatedAt,
+			PaidAt:             bill.PaidAt,
+		},
+		Items:          mapPersistedBillItems(items),
+		TipAllocations: mapInsertedTipAllocations(tipAllocations),
+		Payments:       mapInsertedPayments(payments),
+	}
+
+	return MapBillGraphToCreateBillResponse(graph)
+}
+
 func MapBillGraphToCreateBillResponse(graph BillGraph) CreateBillResponse {
 	return CreateBillResponse{
 		Bill:           mapBillHeader(graph.Bill),
@@ -181,6 +215,56 @@ func mapReceiptPayments(payments []BillPaymentRecord) []ReceiptPaymentResponse {
 			PaymentMethod: payment.PaymentMethod,
 			Amount:        payment.Amount,
 			Status:        payment.Status,
+		})
+	}
+	return response
+}
+
+func mapPersistedBillItems(items []PersistedBillItem) []BillItemRecord {
+	response := make([]BillItemRecord, 0, len(items))
+	for _, item := range items {
+		response = append(response, BillItemRecord{
+			ID:                   item.ID,
+			CatalogueItemID:      item.CatalogueItemID,
+			ServiceName:          item.ServiceName,
+			AssignedStaffID:      item.AssignedStaffID,
+			UnitPrice:            item.UnitPrice,
+			Quantity:             item.Quantity,
+			LineGrossAmount:      item.LineGrossAmount,
+			LineDiscountAmount:   item.LineDiscountAmount,
+			LineNetAmount:        item.LineNetAmount,
+			TaxableBaseAmount:    item.TaxableBaseAmount,
+			TaxAmount:            item.TaxAmount,
+			CommissionBaseAmount: item.CommissionBaseAmount,
+			CommissionAmount:     item.CommissionAmount,
+		})
+	}
+	return response
+}
+
+func mapInsertedTipAllocations(allocations []InsertTipAllocationInput) []BillTipAllocationRecord {
+	response := make([]BillTipAllocationRecord, 0, len(allocations))
+	for _, allocation := range allocations {
+		response = append(response, BillTipAllocationRecord{
+			ID:        allocation.ID,
+			StaffID:   allocation.StaffID,
+			TipAmount: allocation.TipAmount,
+		})
+	}
+	return response
+}
+
+func mapInsertedPayments(payments []InsertPaymentInput) []BillPaymentRecord {
+	response := make([]BillPaymentRecord, 0, len(payments))
+	for _, payment := range payments {
+		response = append(response, BillPaymentRecord{
+			ID:            payment.ID,
+			PaymentMethod: payment.PaymentMethod,
+			Amount:        payment.Amount,
+			Status:        payment.Status,
+			CreatedAt:     payment.CreatedAt,
+			UpdatedAt:     payment.UpdatedAt,
+			VerifiedAt:    payment.VerifiedAt,
 		})
 	}
 	return response

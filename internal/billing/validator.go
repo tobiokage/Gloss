@@ -1,10 +1,15 @@
 package billing
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 
 	apperrors "gloss/internal/shared/errors"
+)
+
+var createBillUUIDPattern = regexp.MustCompile(
+	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
 )
 
 type ValidatedCreateBillRequest struct {
@@ -28,16 +33,16 @@ func ValidateCreateBillRequest(req CreateBillRequest) (ValidatedCreateBillReques
 
 	validatedItems := make([]ValidatedCreateBillItem, 0, len(req.Items))
 	for i, item := range req.Items {
-		catalogueItemID := strings.TrimSpace(item.CatalogueItemID)
-		if catalogueItemID == "" {
-			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].catalogue_item_id is required")
+		catalogueItemID, err := validateCreateBillUUID("items["+itoa(i)+"].catalogue_item_id", item.CatalogueItemID)
+		if err != nil {
+			return ValidatedCreateBillRequest{}, err
 		}
 		if item.Quantity <= 0 {
 			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].quantity must be greater than 0")
 		}
-		assignedStaffID := strings.TrimSpace(item.AssignedStaffID)
-		if assignedStaffID == "" {
-			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].assigned_staff_id is required")
+		assignedStaffID, err := validateCreateBillUUID("items["+itoa(i)+"].assigned_staff_id", item.AssignedStaffID)
+		if err != nil {
+			return ValidatedCreateBillRequest{}, err
 		}
 
 		validatedItems = append(validatedItems, ValidatedCreateBillItem{
@@ -218,9 +223,12 @@ func validateTipAllocations(allocations []TipAllocation, tipAmount int64) error 
 	allocationTotal := int64(0)
 	seenStaffIDs := make(map[string]struct{}, len(allocations))
 	for i, allocation := range allocations {
-		if strings.TrimSpace(allocation.StaffID) == "" {
-			return invalidRequest("tip_allocations[" + itoa(i) + "].staff_id is required")
+		normalizedStaffID, err := validateCreateBillUUID("tip_allocations["+itoa(i)+"].staff_id", allocation.StaffID)
+		if err != nil {
+			return err
 		}
+		allocation.StaffID = normalizedStaffID
+		allocations[i] = allocation
 		if _, exists := seenStaffIDs[allocation.StaffID]; exists {
 			return invalidRequest("tip_allocations[" + itoa(i) + "].staff_id must be unique")
 		}
@@ -235,4 +243,16 @@ func validateTipAllocations(allocations []TipAllocation, tipAmount int64) error 
 		return invalidRequest("tip_allocations sum must match tip_amount")
 	}
 	return nil
+}
+
+func validateCreateBillUUID(fieldName string, rawValue string) (string, error) {
+	normalizedValue := strings.TrimSpace(rawValue)
+	if normalizedValue == "" {
+		return "", invalidRequest(fieldName + " is required")
+	}
+	if !createBillUUIDPattern.MatchString(normalizedValue) {
+		return "", invalidRequest(fieldName + " must be a valid UUID")
+	}
+
+	return normalizedValue, nil
 }

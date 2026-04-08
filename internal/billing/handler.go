@@ -32,8 +32,6 @@ func (h *Handler) CreateBill(w nethttp.ResponseWriter, r *nethttp.Request) {
 		return
 	}
 
-	normalizeCreateBillRequest(&req)
-
 	response, err := h.service.CreateBill(r.Context(), authCtx, req)
 	if err != nil {
 		platformhttp.WriteError(w, err)
@@ -41,20 +39,4 @@ func (h *Handler) CreateBill(w nethttp.ResponseWriter, r *nethttp.Request) {
 	}
 
 	platformhttp.WriteJSON(w, nethttp.StatusCreated, response)
-}
-
-func normalizeCreateBillRequest(req *CreateBillRequest) {
-	if req.DiscountAmount == nil {
-		req.DiscountAmount = int64Ptr(0)
-	}
-	if req.TipAmount == nil {
-		req.TipAmount = int64Ptr(0)
-	}
-	if *req.TipAmount == 0 && req.TipAllocations == nil {
-		req.TipAllocations = []CreateBillTipAllocationDTO{}
-	}
-}
-
-func int64Ptr(value int64) *int64 {
-	return &value
 }

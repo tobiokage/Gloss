@@ -26,15 +26,15 @@ func NewService(cfg platformconfig.Config, repo *Repo) *Service {
 }
 
 func (s *Service) Login(ctx context.Context, req LoginRequest) (LoginResult, error) {
-	req.LoginIdentity = strings.TrimSpace(req.LoginIdentity)
-	if req.LoginIdentity == "" || req.Password == "" {
+	req.EmailOrPhone = strings.TrimSpace(req.EmailOrPhone)
+	if req.EmailOrPhone == "" || req.Password == "" {
 		return LoginResult{}, apperrors.New(
 			apperrors.CodeInvalidRequest,
-			"login_identity and password are required",
+			"email_or_phone and password are required",
 		)
 	}
 
-	user, err := s.repo.FindByLoginIdentity(ctx, req.LoginIdentity)
+	user, err := s.repo.FindByLoginIdentity(ctx, req.EmailOrPhone)
 	if err != nil {
 		return LoginResult{}, err
 	}

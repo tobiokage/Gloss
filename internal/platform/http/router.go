@@ -17,6 +17,10 @@ func NewRouter(
 	adminCatalogueCreateHandler nethttp.HandlerFunc,
 	adminCatalogueUpdateHandler nethttp.HandlerFunc,
 	adminCatalogueDeactivateHandler nethttp.HandlerFunc,
+	adminStaffListHandler nethttp.HandlerFunc,
+	adminStaffCreateHandler nethttp.HandlerFunc,
+	adminStaffDeactivateHandler nethttp.HandlerFunc,
+	adminStaffAssignStoreHandler nethttp.HandlerFunc,
 ) *chi.Mux {
 	router := chi.NewRouter()
 
@@ -27,10 +31,14 @@ func NewRouter(
 	router.Post("/auth/login", authLoginHandler)
 	router.With(authMiddleware).Get("/store/bootstrap", storeBootstrapHandler)
 	router.With(authMiddleware, storeManagerOnlyMiddleware).Post("/bills", createBillHandler)
-	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/catalogue-items", adminCatalogueListHandler)
-	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue-items", adminCatalogueCreateHandler)
-	router.With(authMiddleware, superAdminOnlyMiddleware).Put("/admin/catalogue-items/{item_id}", adminCatalogueUpdateHandler)
-	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue-items/{item_id}/deactivate", adminCatalogueDeactivateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/catalogue", adminCatalogueListHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue", adminCatalogueCreateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Put("/admin/catalogue/{item_id}", adminCatalogueUpdateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue/{item_id}/deactivate", adminCatalogueDeactivateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/staff", adminStaffListHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/staff", adminStaffCreateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/staff/{id}/deactivate", adminStaffDeactivateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/staff/{id}/stores/{store_id}", adminStaffAssignStoreHandler)
 
 	return router
 }

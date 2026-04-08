@@ -8,8 +8,8 @@ import (
 )
 
 type LoginRequest struct {
-	LoginIdentity string `json:"login_identity"`
-	Password      string `json:"password"`
+	EmailOrPhone string `json:"email_or_phone"`
+	Password     string `json:"password"`
 }
 
 type LoginResponse struct {

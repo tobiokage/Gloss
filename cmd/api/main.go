@@ -21,6 +21,7 @@ import (
 	platformlogger "gloss/internal/platform/logger"
 	"gloss/internal/shared/enums"
 	"gloss/internal/shared/idempotency"
+	"gloss/internal/staff"
 )
 
 func main() {
@@ -61,6 +62,9 @@ func main() {
 	catalogueRepo := catalogue.NewRepo(db)
 	catalogueService := catalogue.NewService(catalogueRepo)
 	catalogueHandler := catalogue.NewHandler(catalogueService)
+	staffRepo := staff.NewRepo(db)
+	staffService := staff.NewService(staffRepo)
+	staffHandler := staff.NewHandler(staffService)
 	authMiddleware := auth.Middleware(cfg)
 	superAdminOnlyMiddleware := func(next nethttp.Handler) nethttp.Handler {
 		return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
@@ -106,6 +110,10 @@ func main() {
 		catalogueHandler.CreateCatalogueItem,
 		catalogueHandler.UpdateCatalogueItem,
 		catalogueHandler.DeactivateCatalogueItem,
+		staffHandler.ListStaff,
+		staffHandler.CreateStaff,
+		staffHandler.DeactivateStaff,
+		staffHandler.AssignStaffToStore,
 	)
 
 	server := &nethttp.Server{

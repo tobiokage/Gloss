@@ -119,9 +119,14 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 
 	operationTime := time.Now().UTC()
 	var (
-		billID     string
-		billNumber string
-		created    bool
+		billID                string
+		billNumber            string
+		created               bool
+		createdStore          StoreSnapshot
+		createdBillInput      InsertBillInput
+		createdBillItems      []PersistedBillItem
+		createdTipAllocations []InsertTipAllocationInput
+		createdPayments       []InsertPaymentInput
 	)
 
 	err = platformdb.WithTx(ctx, s.db, func(tx *sql.Tx) error {
@@ -145,6 +150,7 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 		if err != nil {
 			return err
 		}
+		createdStore = store
 
 		authoritativeItems, err := s.repo.GetActiveCatalogueLinesByIDs(
 			ctx,
@@ -207,7 +213,7 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 		}
 
 		paidAt := operationTime
-		if err := s.repo.InsertBill(ctx, tx, InsertBillInput{
+		createdBillInput = InsertBillInput{
 			ID:                 billID,
 			TenantID:           createInput.TenantID,
 			StoreID:            createInput.StoreID,
@@ -226,7 +232,8 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			CreatedByUserID:    createInput.UserID,
 			CreatedAt:          operationTime,
 			PaidAt:             &paidAt,
-		}); err != nil {
+		}
+		if err := s.repo.InsertBill(ctx, tx, createdBillInput); err != nil {
 			return err
 		}
 
@@ -234,6 +241,7 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 		if err != nil {
 			return err
 		}
+		createdBillItems = persistedItems
 
 		tipAllocationRows, err := buildTipAllocationRows(billID, calculation.TipAllocations, operationTime)
 		if err != nil {
@@ -242,6 +250,7 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 		if err := s.repo.InsertBillTipAllocations(ctx, tx, tipAllocationRows); err != nil {
 			return err
 		}
+		createdTipAllocations = tipAllocationRows
 
 		commissionRows, err := buildCommissionLedgerRows(billID, persistedItems, operationTime)
 		if err != nil {
@@ -260,7 +269,7 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			)
 		}
 
-		if err := s.repo.InsertPayment(ctx, tx, InsertPaymentInput{
+		paymentInput := InsertPaymentInput{
 			ID:            paymentID,
 			BillID:        billID,
 			PaymentMethod: string(PaymentModeCash),
@@ -269,9 +278,11 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			VerifiedAt:    &operationTime,
 			CreatedAt:     operationTime,
 			UpdatedAt:     operationTime,
-		}); err != nil {
+		}
+		if err := s.repo.InsertPayment(ctx, tx, paymentInput); err != nil {
 			return err
 		}
+		createdPayments = []InsertPaymentInput{paymentInput}
 
 		if err := s.idempotencyStore.CompleteCreateBill(
 			ctx,
@@ -303,12 +314,15 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 		return CreateBillResponse{}, apperrors.New(apperrors.CodeInternalError, "Create bill did not resolve a bill reference")
 	}
 
-	graph, err := s.repo.GetBillGraph(ctx, billID, createInput.TenantID, createInput.StoreID)
-	if err != nil {
-		return CreateBillResponse{}, err
-	}
-
 	if created {
+		response := BuildCreateBillSuccessResponse(
+			createdStore,
+			createdBillInput,
+			createdBillItems,
+			createdTipAllocations,
+			createdPayments,
+		)
+
 		if s.auditRecorder != nil {
 			if err := s.auditRecorder.RecordBillCreated(
 				ctx,
@@ -321,13 +335,13 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 					"client_bill_ref":   createInput.ClientBillRef,
 					"idempotency_key":   createInput.IdempotencyKey,
 					"payment_mode":      string(createInput.Request.Payment.Mode),
-					"total_amount":      graph.Bill.TotalAmount,
-					"amount_paid":       graph.Bill.AmountPaid,
-					"amount_due":        graph.Bill.AmountDue,
-					"service_net":       graph.Bill.ServiceNetAmount,
-					"discount_amount":   graph.Bill.DiscountAmount,
-					"tip_amount":        graph.Bill.TipAmount,
-					"payment_row_count": len(graph.Payments),
+					"total_amount":      response.Bill.TotalAmount,
+					"amount_paid":       response.Bill.AmountPaid,
+					"amount_due":        response.Bill.AmountDue,
+					"service_net":       response.Bill.ServiceNetAmount,
+					"discount_amount":   response.Bill.DiscountAmount,
+					"tip_amount":        response.Bill.TipAmount,
+					"payment_row_count": len(response.Payments),
 				},
 			); err != nil {
 				s.logger.Error(
@@ -348,17 +362,23 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			"store_id", createInput.StoreID,
 			"user_id", createInput.UserID,
 			"payment_mode", string(createInput.Request.Payment.Mode),
-			"total_amount", graph.Bill.TotalAmount,
+			"total_amount", response.Bill.TotalAmount,
 		)
-	} else {
-		s.logger.Info(
-			"create bill idempotency replay",
-			"bill_id", billID,
-			"tenant_id", createInput.TenantID,
-			"store_id", createInput.StoreID,
-			"idempotency_key", createInput.IdempotencyKey,
-		)
+		return response, nil
 	}
+
+	graph, err := s.repo.GetBillGraph(ctx, billID, createInput.TenantID, createInput.StoreID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	s.logger.Info(
+		"create bill idempotency replay",
+		"bill_id", billID,
+		"tenant_id", createInput.TenantID,
+		"store_id", createInput.StoreID,
+		"idempotency_key", createInput.IdempotencyKey,
+	)
 
 	return MapBillGraphToCreateBillResponse(graph), nil
 }
