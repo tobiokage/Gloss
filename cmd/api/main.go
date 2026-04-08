@@ -12,10 +12,12 @@ import (
 
 	"gloss/internal/auth"
 	"gloss/internal/bootstrap"
+	"gloss/internal/catalogue"
 	platformconfig "gloss/internal/platform/config"
 	platformdb "gloss/internal/platform/db"
 	platformhttp "gloss/internal/platform/http"
 	platformlogger "gloss/internal/platform/logger"
+	"gloss/internal/shared/enums"
 )
 
 func main() {
@@ -47,16 +49,37 @@ func main() {
 	bootstrapRepo := bootstrap.NewRepo(db)
 	bootstrapService := bootstrap.NewService(bootstrapRepo)
 	bootstrapHandler := bootstrap.NewHandler(bootstrapService)
+	catalogueRepo := catalogue.NewRepo(db)
+	catalogueService := catalogue.NewService(catalogueRepo)
+	catalogueHandler := catalogue.NewHandler(catalogueService)
 	authMiddleware := auth.Middleware(cfg)
+	superAdminOnlyMiddleware := func(next nethttp.Handler) nethttp.Handler {
+		return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+			authCtx, err := auth.AuthContextFromContext(r.Context())
+			if err != nil {
+				platformhttp.WriteError(w, err)
+				return
+			}
 
-	authLoginHandler := authHandler.Login
-	storeBootstrapHandler := bootstrapHandler.GetStoreBootstrap
-	if authLoginHandler == nil || storeBootstrapHandler == nil || authMiddleware == nil {
-		logger.Error("router dependencies are required")
-		os.Exit(1)
+			if err := auth.RequireRole(authCtx, enums.RoleSuperAdmin); err != nil {
+				platformhttp.WriteError(w, err)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
 	}
 
-	router := platformhttp.NewRouter(authLoginHandler, authMiddleware, storeBootstrapHandler)
+	router := platformhttp.NewRouter(
+		authHandler.Login,
+		authMiddleware,
+		superAdminOnlyMiddleware,
+		bootstrapHandler.GetStoreBootstrap,
+		catalogueHandler.ListCatalogueItems,
+		catalogueHandler.CreateCatalogueItem,
+		catalogueHandler.UpdateCatalogueItem,
+		catalogueHandler.DeactivateCatalogueItem,
+	)
 
 	server := &nethttp.Server{
 		Addr:              ":" + cfg.HTTPPort,

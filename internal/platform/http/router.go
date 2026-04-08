@@ -9,7 +9,12 @@ import (
 func NewRouter(
 	authLoginHandler nethttp.HandlerFunc,
 	authMiddleware func(next nethttp.Handler) nethttp.Handler,
+	superAdminOnlyMiddleware func(next nethttp.Handler) nethttp.Handler,
 	storeBootstrapHandler nethttp.HandlerFunc,
+	adminCatalogueListHandler nethttp.HandlerFunc,
+	adminCatalogueCreateHandler nethttp.HandlerFunc,
+	adminCatalogueUpdateHandler nethttp.HandlerFunc,
+	adminCatalogueDeactivateHandler nethttp.HandlerFunc,
 ) *chi.Mux {
 	router := chi.NewRouter()
 
@@ -19,6 +24,10 @@ func NewRouter(
 
 	router.Post("/auth/login", authLoginHandler)
 	router.With(authMiddleware).Get("/store/bootstrap", storeBootstrapHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/catalogue-items", adminCatalogueListHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue-items", adminCatalogueCreateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Put("/admin/catalogue-items/{item_id}", adminCatalogueUpdateHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue-items/{item_id}/deactivate", adminCatalogueDeactivateHandler)
 
 	return router
 }
