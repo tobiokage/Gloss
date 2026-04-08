@@ -1,0 +1,233 @@
+package billing
+
+import (
+	"strconv"
+	"strings"
+
+	apperrors "gloss/internal/shared/errors"
+)
+
+type ValidatedCreateBillRequest struct {
+	Items          []ValidatedCreateBillItem
+	DiscountAmount int64
+	TipAmount      int64
+	TipAllocations []TipAllocation
+	Payment        PaymentInput
+}
+
+type ValidatedCreateBillItem struct {
+	CatalogueItemID string
+	Quantity        int64
+	AssignedStaffID string
+}
+
+func ValidateCreateBillRequest(req CreateBillRequest) (ValidatedCreateBillRequest, error) {
+	if len(req.Items) == 0 {
+		return ValidatedCreateBillRequest{}, invalidRequest("items are required")
+	}
+
+	validatedItems := make([]ValidatedCreateBillItem, 0, len(req.Items))
+	for i, item := range req.Items {
+		catalogueItemID := strings.TrimSpace(item.CatalogueItemID)
+		if catalogueItemID == "" {
+			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].catalogue_item_id is required")
+		}
+		if item.Quantity <= 0 {
+			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].quantity must be greater than 0")
+		}
+		assignedStaffID := strings.TrimSpace(item.AssignedStaffID)
+		if assignedStaffID == "" {
+			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].assigned_staff_id is required")
+		}
+
+		validatedItems = append(validatedItems, ValidatedCreateBillItem{
+			CatalogueItemID: catalogueItemID,
+			Quantity:        item.Quantity,
+			AssignedStaffID: assignedStaffID,
+		})
+	}
+
+	discountAmount := int64(0)
+	if req.DiscountAmount != nil {
+		discountAmount = *req.DiscountAmount
+	}
+	if discountAmount < 0 {
+		return ValidatedCreateBillRequest{}, invalidRequest("discount_amount cannot be negative")
+	}
+
+	tipAmount := int64(0)
+	if req.TipAmount != nil {
+		tipAmount = *req.TipAmount
+	}
+	if tipAmount < 0 {
+		return ValidatedCreateBillRequest{}, invalidRequest("tip_amount cannot be negative")
+	}
+
+	payment, err := validateAndNormalizePayment(req.Payment)
+	if err != nil {
+		return ValidatedCreateBillRequest{}, err
+	}
+
+	tipAllocations, err := validateAndNormalizeTipAllocations(req.TipAllocations, tipAmount)
+	if err != nil {
+		return ValidatedCreateBillRequest{}, err
+	}
+
+	if payment.Mode == PaymentModeSplit && payment.CashAmount <= 0 {
+		return ValidatedCreateBillRequest{}, invalidRequest("payment.cash_amount must be greater than 0 for SPLIT")
+	}
+	if payment.Mode != PaymentModeSplit && payment.CashAmount != 0 {
+		return ValidatedCreateBillRequest{}, invalidRequest("payment.cash_amount is only allowed for SPLIT mode")
+	}
+
+	return ValidatedCreateBillRequest{
+		Items:          validatedItems,
+		DiscountAmount: discountAmount,
+		TipAmount:      tipAmount,
+		TipAllocations: tipAllocations,
+		Payment:        payment,
+	}, nil
+}
+
+func ValidateCalculatorInput(input CalculatorInput) error {
+	if len(input.Lines) == 0 {
+		return invalidRequest("at least one authoritative line is required")
+	}
+
+	serviceGrossAmount := int64(0)
+	for i, line := range input.Lines {
+		if strings.TrimSpace(line.CatalogueItemID) == "" {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].catalogue_item_id is required")
+		}
+		if strings.TrimSpace(line.AssignedStaffID) == "" {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].assigned_staff_id is required")
+		}
+		if line.UnitPrice <= 0 {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].unit_price must be greater than 0")
+		}
+		if line.Quantity <= 0 {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].quantity must be greater than 0")
+		}
+		serviceGrossAmount += line.UnitPrice * line.Quantity
+	}
+
+	if input.DiscountAmount < 0 {
+		return invalidRequest("discount_amount cannot be negative")
+	}
+	if input.TipAmount < 0 {
+		return invalidRequest("tip_amount cannot be negative")
+	}
+
+	maxDiscount := maxDiscountAmount(serviceGrossAmount)
+	if input.DiscountAmount > maxDiscount {
+		return invalidRequest("discount_amount exceeds 30% cap of service subtotal")
+	}
+
+	if err := validateTipAllocations(input.TipAllocations, input.TipAmount); err != nil {
+		return err
+	}
+
+	totalAmount := serviceGrossAmount - input.DiscountAmount + input.TipAmount
+	if totalAmount <= 0 {
+		return invalidRequest("total_amount must be greater than 0")
+	}
+
+	if _, err := validatePaymentMode(input.Payment.Mode); err != nil {
+		return err
+	}
+	switch input.Payment.Mode {
+	case PaymentModeSplit:
+		if input.Payment.CashAmount <= 0 {
+			return invalidRequest("payment.cash_amount must be greater than 0 for SPLIT")
+		}
+		if input.Payment.CashAmount >= totalAmount {
+			return invalidRequest("payment.cash_amount must be less than total_amount for SPLIT")
+		}
+	default:
+		if input.Payment.CashAmount != 0 {
+			return invalidRequest("payment.cash_amount is only allowed for SPLIT mode")
+		}
+	}
+
+	return nil
+}
+
+func validateAndNormalizePayment(payment CreateBillPaymentRequest) (PaymentInput, error) {
+	mode, err := validatePaymentMode(PaymentMode(strings.ToUpper(strings.TrimSpace(payment.Mode))))
+	if err != nil {
+		return PaymentInput{}, err
+	}
+
+	cashAmount := int64(0)
+	if payment.CashAmount != nil {
+		cashAmount = *payment.CashAmount
+	}
+
+	if cashAmount < 0 {
+		return PaymentInput{}, invalidRequest("payment.cash_amount cannot be negative")
+	}
+
+	return PaymentInput{
+		Mode:       mode,
+		CashAmount: cashAmount,
+	}, nil
+}
+
+func validatePaymentMode(mode PaymentMode) (PaymentMode, error) {
+	switch mode {
+	case PaymentModeCash, PaymentModeUPI, PaymentModeSplit:
+		return mode, nil
+	default:
+		return "", invalidRequest("payment.mode must be one of CASH, UPI, SPLIT")
+	}
+}
+
+func validateAndNormalizeTipAllocations(raw []CreateBillTipAllocationDTO, tipAmount int64) ([]TipAllocation, error) {
+	normalized := make([]TipAllocation, 0, len(raw))
+
+	for _, allocation := range raw {
+		normalized = append(normalized, TipAllocation{
+			StaffID:   strings.TrimSpace(allocation.StaffID),
+			TipAmount: allocation.TipAmount,
+		})
+	}
+
+	if err := validateTipAllocations(normalized, tipAmount); err != nil {
+		return nil, err
+	}
+
+	return normalized, nil
+}
+
+func invalidRequest(message string) error {
+	return apperrors.New(apperrors.CodeInvalidRequest, message)
+}
+
+func itoa(value int) string {
+	return strconv.Itoa(value)
+}
+
+func validateTipAllocations(allocations []TipAllocation, tipAmount int64) error {
+	if tipAmount == 0 {
+		if len(allocations) > 0 {
+			return invalidRequest("tip_allocations must be empty when tip_amount is 0")
+		}
+		return nil
+	}
+
+	allocationTotal := int64(0)
+	for i, allocation := range allocations {
+		if strings.TrimSpace(allocation.StaffID) == "" {
+			return invalidRequest("tip_allocations[" + itoa(i) + "].staff_id is required")
+		}
+		if allocation.TipAmount < 0 {
+			return invalidRequest("tip_allocations[" + itoa(i) + "].tip_amount cannot be negative")
+		}
+		allocationTotal += allocation.TipAmount
+	}
+
+	if allocationTotal != tipAmount {
+		return invalidRequest("tip_allocations sum must match tip_amount")
+	}
+	return nil
+}
