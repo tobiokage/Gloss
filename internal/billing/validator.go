@@ -216,10 +216,15 @@ func validateTipAllocations(allocations []TipAllocation, tipAmount int64) error 
 	}
 
 	allocationTotal := int64(0)
+	seenStaffIDs := make(map[string]struct{}, len(allocations))
 	for i, allocation := range allocations {
 		if strings.TrimSpace(allocation.StaffID) == "" {
 			return invalidRequest("tip_allocations[" + itoa(i) + "].staff_id is required")
 		}
+		if _, exists := seenStaffIDs[allocation.StaffID]; exists {
+			return invalidRequest("tip_allocations[" + itoa(i) + "].staff_id must be unique")
+		}
+		seenStaffIDs[allocation.StaffID] = struct{}{}
 		if allocation.TipAmount < 0 {
 			return invalidRequest("tip_allocations[" + itoa(i) + "].tip_amount cannot be negative")
 		}

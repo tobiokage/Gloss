@@ -10,7 +10,9 @@ import (
 	"syscall"
 	"time"
 
+	"gloss/internal/audit"
 	"gloss/internal/auth"
+	"gloss/internal/billing"
 	"gloss/internal/bootstrap"
 	"gloss/internal/catalogue"
 	platformconfig "gloss/internal/platform/config"
@@ -18,6 +20,7 @@ import (
 	platformhttp "gloss/internal/platform/http"
 	platformlogger "gloss/internal/platform/logger"
 	"gloss/internal/shared/enums"
+	"gloss/internal/shared/idempotency"
 )
 
 func main() {
@@ -49,6 +52,12 @@ func main() {
 	bootstrapRepo := bootstrap.NewRepo(db)
 	bootstrapService := bootstrap.NewService(bootstrapRepo)
 	bootstrapHandler := bootstrap.NewHandler(bootstrapService)
+	auditRepo := audit.NewRepo(db)
+	auditService := audit.NewService(auditRepo)
+	idempotencyStore := idempotency.NewStore()
+	billingRepo := billing.NewRepo(db)
+	billingService := billing.NewService(db, billingRepo, idempotencyStore, auditService, logger.With("module", "billing"))
+	billingHandler := billing.NewHandler(billingService)
 	catalogueRepo := catalogue.NewRepo(db)
 	catalogueService := catalogue.NewService(catalogueRepo)
 	catalogueHandler := catalogue.NewHandler(catalogueService)
@@ -69,12 +78,30 @@ func main() {
 			next.ServeHTTP(w, r)
 		})
 	}
+	storeManagerOnlyMiddleware := func(next nethttp.Handler) nethttp.Handler {
+		return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+			authCtx, err := auth.AuthContextFromContext(r.Context())
+			if err != nil {
+				platformhttp.WriteError(w, err)
+				return
+			}
+
+			if err := auth.RequireRole(authCtx, enums.RoleStoreManager); err != nil {
+				platformhttp.WriteError(w, err)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
 
 	router := platformhttp.NewRouter(
 		authHandler.Login,
 		authMiddleware,
 		superAdminOnlyMiddleware,
+		storeManagerOnlyMiddleware,
 		bootstrapHandler.GetStoreBootstrap,
+		billingHandler.CreateBill,
 		catalogueHandler.ListCatalogueItems,
 		catalogueHandler.CreateCatalogueItem,
 		catalogueHandler.UpdateCatalogueItem,

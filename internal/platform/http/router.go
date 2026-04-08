@@ -10,7 +10,9 @@ func NewRouter(
 	authLoginHandler nethttp.HandlerFunc,
 	authMiddleware func(next nethttp.Handler) nethttp.Handler,
 	superAdminOnlyMiddleware func(next nethttp.Handler) nethttp.Handler,
+	storeManagerOnlyMiddleware func(next nethttp.Handler) nethttp.Handler,
 	storeBootstrapHandler nethttp.HandlerFunc,
+	createBillHandler nethttp.HandlerFunc,
 	adminCatalogueListHandler nethttp.HandlerFunc,
 	adminCatalogueCreateHandler nethttp.HandlerFunc,
 	adminCatalogueUpdateHandler nethttp.HandlerFunc,
@@ -24,6 +26,7 @@ func NewRouter(
 
 	router.Post("/auth/login", authLoginHandler)
 	router.With(authMiddleware).Get("/store/bootstrap", storeBootstrapHandler)
+	router.With(authMiddleware, storeManagerOnlyMiddleware).Post("/bills", createBillHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/catalogue-items", adminCatalogueListHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue-items", adminCatalogueCreateHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Put("/admin/catalogue-items/{item_id}", adminCatalogueUpdateHandler)
