@@ -9,6 +9,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	platformconfig "gloss/internal/platform/config"
+	"gloss/internal/shared/enums"
 	apperrors "gloss/internal/shared/errors"
 )
 
@@ -46,29 +47,21 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (LoginResult, err
 		return LoginResult{}, apperrors.New(apperrors.CodeUnauthorized, "Invalid credentials")
 	}
 
-	if user.Role == "STORE_MANAGER" && user.StoreID == "" {
+	if HasRole(user.Role, enums.RoleStoreManager) && user.StoreID == "" {
 		return LoginResult{}, apperrors.New(apperrors.CodeUnauthorized, "Invalid manager store scope")
 	}
 
-	token, expiresAt, err := s.signToken(user)
+	token, err := s.signToken(user)
 	if err != nil {
 		return LoginResult{}, err
 	}
 
 	return LoginResult{
 		Token: token,
-		Session: SessionUser{
-			UserID:   user.ID,
-			TenantID: user.TenantID,
-			StoreID:  user.StoreID,
-			Role:     user.Role,
-			Name:     user.Name,
-		},
-		ExpiresAt: expiresAt,
 	}, nil
 }
 
-func (s *Service) signToken(user UserRecord) (string, time.Time, error) {
+func (s *Service) signToken(user UserRecord) (string, error) {
 	now := time.Now().UTC()
 	expiresAt := now.Add(s.cfg.Auth.JWTTTL)
 
@@ -86,12 +79,12 @@ func (s *Service) signToken(user UserRecord) (string, time.Time, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(s.cfg.Auth.JWTSecret))
 	if err != nil {
-		return "", time.Time{}, apperrors.NewWithDetails(
+		return "", apperrors.NewWithDetails(
 			apperrors.CodeInternalError,
 			"Failed to issue token",
 			map[string]any{"reason": err.Error()},
 		)
 	}
 
-	return signed, expiresAt, nil
+	return signed, nil
 }

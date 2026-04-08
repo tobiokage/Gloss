@@ -22,12 +22,12 @@ func main() {
 	path := flag.String("path", "file://schema/postgres/migrations", "migration files path")
 	flag.Parse()
 
-	cfg, err := platformconfig.Load()
+	dbCfg, err := platformconfig.LoadDB()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
 
-	db, err := openDB(cfg)
+	db, err := openDB(dbCfg)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -65,15 +65,15 @@ func main() {
 	log.Printf("migration command %q completed", *command)
 }
 
-func openDB(cfg platformconfig.Config) (*sql.DB, error) {
+func openDB(cfg platformconfig.DBConfig) (*sql.DB, error) {
 	dsn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.DB.Host,
-		cfg.DB.Port,
-		cfg.DB.User,
-		cfg.DB.Password,
-		cfg.DB.Name,
-		cfg.DB.SSLMode,
+		cfg.Host,
+		cfg.Port,
+		cfg.User,
+		cfg.Password,
+		cfg.Name,
+		cfg.SSLMode,
 	)
 
 	return sql.Open("pgx", dsn)

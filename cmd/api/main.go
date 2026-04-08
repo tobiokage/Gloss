@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"errors"
-	"log/slog"
+	"fmt"
 	nethttp "net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"gloss/internal/auth"
+	"gloss/internal/bootstrap"
 	platformconfig "gloss/internal/platform/config"
 	platformdb "gloss/internal/platform/db"
 	platformhttp "gloss/internal/platform/http"
@@ -19,7 +21,7 @@ import (
 func main() {
 	cfg, err := platformconfig.Load()
 	if err != nil {
-		slog.Error("failed to load config", "error", err)
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -39,13 +41,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	app := platformhttp.App{
-		Config: cfg,
-		Logger: logger,
-		DB:     db,
+	authRepo := auth.NewRepo(db)
+	authService := auth.NewService(cfg, authRepo)
+	authHandler := auth.NewHandler(authService)
+	bootstrapRepo := bootstrap.NewRepo(db)
+	bootstrapService := bootstrap.NewService(bootstrapRepo)
+	bootstrapHandler := bootstrap.NewHandler(bootstrapService)
+	authMiddleware := auth.Middleware(cfg)
+
+	authLoginHandler := authHandler.Login
+	storeBootstrapHandler := bootstrapHandler.GetStoreBootstrap
+	if authLoginHandler == nil || storeBootstrapHandler == nil || authMiddleware == nil {
+		logger.Error("router dependencies are required")
+		os.Exit(1)
 	}
 
-	router := platformhttp.NewRouter(app)
+	router := platformhttp.NewRouter(authLoginHandler, authMiddleware, storeBootstrapHandler)
 
 	server := &nethttp.Server{
 		Addr:              ":" + cfg.HTTPPort,

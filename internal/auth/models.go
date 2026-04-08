@@ -1,9 +1,10 @@
 package auth
 
 import (
-	"time"
-
 	"github.com/golang-jwt/jwt/v5"
+
+	"gloss/internal/shared/enums"
+	apperrors "gloss/internal/shared/errors"
 )
 
 type LoginRequest struct {
@@ -11,17 +12,8 @@ type LoginRequest struct {
 	Password      string `json:"password"`
 }
 
-type SessionUser struct {
-	UserID   string `json:"user_id"`
-	TenantID string `json:"tenant_id"`
-	StoreID  string `json:"store_id"`
-	Role     string `json:"role"`
-	Name     string `json:"name"`
-}
-
 type LoginResponse struct {
-	Token   string      `json:"token"`
-	Session SessionUser `json:"session"`
+	Token string `json:"token"`
 }
 
 type AuthContext struct {
@@ -36,8 +28,6 @@ type UserRecord struct {
 	TenantID     string
 	StoreID      string
 	Role         string
-	Name         string
-	EmailOrPhone string
 	PasswordHash string
 	Active       bool
 }
@@ -60,7 +50,16 @@ func (c Claims) AuthContext() AuthContext {
 }
 
 type LoginResult struct {
-	Token     string
-	Session   SessionUser
-	ExpiresAt time.Time
+	Token string
+}
+
+func HasRole(actualRole string, expected enums.Role) bool {
+	return actualRole == string(expected)
+}
+
+func RequireRole(authCtx AuthContext, expected enums.Role) error {
+	if !HasRole(authCtx.Role, expected) {
+		return apperrors.New(apperrors.CodeUnauthorized, "User role is not allowed")
+	}
+	return nil
 }

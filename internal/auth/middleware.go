@@ -9,6 +9,7 @@ import (
 
 	platformconfig "gloss/internal/platform/config"
 	platformhttp "gloss/internal/platform/http"
+	"gloss/internal/shared/enums"
 	apperrors "gloss/internal/shared/errors"
 )
 
@@ -45,7 +46,7 @@ func Middleware(cfg platformconfig.Config) func(next nethttp.Handler) nethttp.Ha
 				platformhttp.WriteError(w, apperrors.New(apperrors.CodeUnauthorized, "Invalid token claims"))
 				return
 			}
-			if claims.Role == "STORE_MANAGER" && claims.StoreID == "" {
+			if HasRole(claims.Role, enums.RoleStoreManager) && claims.StoreID == "" {
 				platformhttp.WriteError(w, apperrors.New(apperrors.CodeUnauthorized, "Invalid token claims"))
 				return
 			}

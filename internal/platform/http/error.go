@@ -47,6 +47,8 @@ func statusFromCode(code apperrors.Code) int {
 		return nethttp.StatusServiceUnavailable
 	case apperrors.CodeNotFound:
 		return nethttp.StatusNotFound
+	case apperrors.CodeUnauthorized:
+		return nethttp.StatusUnauthorized
 	default:
 		return nethttp.StatusInternalServerError
 	}

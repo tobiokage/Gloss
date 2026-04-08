@@ -23,8 +23,6 @@ SELECT
 	COALESCE(tenant_id::text, ''),
 	COALESCE(store_id::text, ''),
 	role,
-	name,
-	email_or_phone,
 	password_hash,
 	active
 FROM users
@@ -37,8 +35,6 @@ LIMIT 1`
 		&user.TenantID,
 		&user.StoreID,
 		&user.Role,
-		&user.Name,
-		&user.EmailOrPhone,
 		&user.PasswordHash,
 		&user.Active,
 	)

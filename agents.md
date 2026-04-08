@@ -982,3 +982,17 @@ When choosing between two implementations, prefer the one that:
 - reduces module coupling
 - removes future cleanup work
 - is easier for the next engineer to read in one pass
+
+-------
+
+Code Review rules - 
+
+Check cross-module boundaries, not just milestone-local correctness.
+
+Treat every extra field, helper, layer, or dependency as suspicious unless explicitly justified by HLD, LLD, or agents.md.
+
+Always audit for hidden coupling, inconsistent patterns, and configuration bleed between binaries/modules.
+
+Require one clear ownership path for routing, logging, auth, and role enforcement; no ad hoc duplicates.
+
+Review against all docs together and flag anything that cannot be directly defended.

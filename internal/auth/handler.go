@@ -32,7 +32,6 @@ func (h *Handler) Login(w nethttp.ResponseWriter, r *nethttp.Request) {
 	}
 
 	platformhttp.WriteJSON(w, nethttp.StatusOK, LoginResponse{
-		Token:   result.Token,
-		Session: result.Session,
+		Token: result.Token,
 	})
 }
