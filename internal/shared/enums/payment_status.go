@@ -7,4 +7,5 @@ const (
 	PaymentStatusPending   PaymentStatus = "PENDING"
 	PaymentStatusSuccess   PaymentStatus = "SUCCESS"
 	PaymentStatusFailed    PaymentStatus = "FAILED"
+	PaymentStatusCancelled PaymentStatus = "CANCELLED"
 )

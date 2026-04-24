@@ -7,13 +7,14 @@ VALUES (
     NOW()
 );
 
-INSERT INTO stores (id, tenant_id, name, code, location, active, created_at, updated_at)
+INSERT INTO stores (id, tenant_id, name, code, location, hdfc_terminal_tid, active, created_at, updated_at)
 VALUES (
     '22222222-2222-2222-2222-222222222222',
     '11111111-1111-1111-1111-111111111111',
     'Demo Store',
     'STORE001',
     'Bangalore',
+    '63000019',
     TRUE,
     NOW(),
     NOW()
@@ -38,6 +39,31 @@ VALUES (
     'STORE_MANAGER',
     'Demo Manager',
     'manager@example.com',
+    '$2a$10$.xoIIvLtvarehUlVABIMfOUZZJCmQf8l8f8IkhxsaARzFhz4psPbe',
+    TRUE,
+    NOW(),
+    NOW()
+);
+
+INSERT INTO users (
+    id,
+    tenant_id,
+    store_id,
+    role,
+    name,
+    email_or_phone,
+    password_hash,
+    active,
+    created_at,
+    updated_at
+)
+VALUES (
+    '33333333-3333-3333-3333-333333333334',
+    '11111111-1111-1111-1111-111111111111',
+    NULL,
+    'SUPER_ADMIN',
+    'Demo Super Admin',
+    'admin@example.com',
     '$2a$10$.xoIIvLtvarehUlVABIMfOUZZJCmQf8l8f8IkhxsaARzFhz4psPbe',
     TRUE,
     NOW(),

@@ -27,11 +27,24 @@ type auditRecorder interface {
 	) error
 }
 
+type onlinePaymentCoordinator interface {
+	EnsureStoreReadyForOnline(ctx context.Context, tenantID string, storeID string) error
+	InitiateBillOnlinePayment(
+		ctx context.Context,
+		tenantID string,
+		storeID string,
+		billID string,
+		paymentID string,
+		performedByUserID string,
+	) error
+}
+
 type Service struct {
 	db               *sql.DB
 	repo             *Repo
 	idempotencyStore *idempotency.Store
 	auditRecorder    auditRecorder
+	payments         onlinePaymentCoordinator
 	logger           *slog.Logger
 }
 
@@ -41,18 +54,24 @@ func NewService(
 	idempotencyStore *idempotency.Store,
 	auditRecorder auditRecorder,
 	logger *slog.Logger,
+	payments ...onlinePaymentCoordinator,
 ) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	return &Service{
+	service := &Service{
 		db:               db,
 		repo:             repo,
 		idempotencyStore: idempotencyStore,
 		auditRecorder:    auditRecorder,
 		logger:           logger,
 	}
+	if len(payments) > 0 {
+		service.payments = payments[0]
+	}
+
+	return service
 }
 
 func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req CreateBillRequest) (CreateBillResponse, error) {
@@ -74,12 +93,6 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 	validatedRequest, err := ValidateCreateBillRequest(req)
 	if err != nil {
 		return CreateBillResponse{}, err
-	}
-	if validatedRequest.Payment.Mode != PaymentModeCash {
-		return CreateBillResponse{}, apperrors.New(
-			apperrors.CodeInvalidRequest,
-			"payment.mode CASH is the only supported mode for create bill in this milestone",
-		)
 	}
 
 	requestHash, err := idempotency.CanonicalRequestHash(struct {
@@ -119,14 +132,15 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 
 	operationTime := time.Now().UTC()
 	var (
-		billID                string
-		billNumber            string
-		created               bool
-		createdStore          StoreSnapshot
-		createdBillInput      InsertBillInput
-		createdBillItems      []PersistedBillItem
-		createdTipAllocations []InsertTipAllocationInput
-		createdPayments       []InsertPaymentInput
+		billID                 string
+		billNumber             string
+		created                bool
+		createdStore           StoreSnapshot
+		createdBillInput       InsertBillInput
+		createdBillItems       []PersistedBillItem
+		createdTipAllocations  []InsertTipAllocationInput
+		createdPayments        []InsertPaymentInput
+		createdOnlinePaymentID string
 	)
 
 	err = platformdb.WithTx(ctx, s.db, func(tx *sql.Tx) error {
@@ -144,6 +158,17 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 		if claim.Completed {
 			billID = claim.ResponseBillID
 			return nil
+		}
+		if createInput.Request.Payment.Mode != PaymentModeCash && s.payments == nil {
+			return apperrors.New(
+				apperrors.CodeInternalError,
+				"HDFC payment service is not configured",
+			)
+		}
+		if createInput.Request.Payment.Mode != PaymentModeCash {
+			if err := s.payments.EnsureStoreReadyForOnline(ctx, createInput.TenantID, createInput.StoreID); err != nil {
+				return err
+			}
 		}
 
 		store, err := s.repo.GetActiveStoreSnapshot(ctx, tx, createInput.TenantID, createInput.StoreID)
@@ -212,7 +237,10 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			)
 		}
 
-		paidAt := operationTime
+		var paidAt *time.Time
+		if calculation.Status == enums.BillStatusPaid {
+			paidAt = &operationTime
+		}
 		createdBillInput = InsertBillInput{
 			ID:                 billID,
 			TenantID:           createInput.TenantID,
@@ -231,7 +259,7 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			PaymentModeSummary: string(calculation.PaymentMode),
 			CreatedByUserID:    createInput.UserID,
 			CreatedAt:          operationTime,
-			PaidAt:             &paidAt,
+			PaidAt:             paidAt,
 		}
 		if err := s.repo.InsertBill(ctx, tx, createdBillInput); err != nil {
 			return err
@@ -260,29 +288,17 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			return err
 		}
 
-		paymentID, err := newServiceUUIDString()
+		paymentInputs, onlinePaymentID, err := buildInitialPaymentRows(billID, calculation, operationTime)
 		if err != nil {
-			return apperrors.NewWithDetails(
-				apperrors.CodeInternalError,
-				"Failed to create cash payment",
-				map[string]any{"reason": err.Error()},
-			)
-		}
-
-		paymentInput := InsertPaymentInput{
-			ID:            paymentID,
-			BillID:        billID,
-			PaymentMethod: string(PaymentModeCash),
-			Amount:        calculation.Totals.TotalAmount,
-			Status:        string(enums.PaymentStatusSuccess),
-			VerifiedAt:    &operationTime,
-			CreatedAt:     operationTime,
-			UpdatedAt:     operationTime,
-		}
-		if err := s.repo.InsertPayment(ctx, tx, paymentInput); err != nil {
 			return err
 		}
-		createdPayments = []InsertPaymentInput{paymentInput}
+		for _, paymentInput := range paymentInputs {
+			if err := s.repo.InsertPayment(ctx, tx, paymentInput); err != nil {
+				return err
+			}
+		}
+		createdPayments = paymentInputs
+		createdOnlinePaymentID = onlinePaymentID
 
 		if err := s.idempotencyStore.CompleteCreateBill(
 			ctx,
@@ -315,6 +331,26 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 	}
 
 	if created {
+		if createdOnlinePaymentID != "" {
+			if err := s.payments.InitiateBillOnlinePayment(
+				ctx,
+				createInput.TenantID,
+				createInput.StoreID,
+				billID,
+				createdOnlinePaymentID,
+				createInput.UserID,
+			); err != nil {
+				s.logger.Error(
+					"HDFC sale initiation did not complete after bill commit",
+					"bill_id", billID,
+					"payment_id", createdOnlinePaymentID,
+					"tenant_id", createInput.TenantID,
+					"store_id", createInput.StoreID,
+					"error", err,
+				)
+			}
+		}
+
 		response := BuildCreateBillSuccessResponse(
 			createdStore,
 			createdBillInput,
@@ -322,6 +358,13 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 			createdTipAllocations,
 			createdPayments,
 		)
+		if createdOnlinePaymentID != "" {
+			graph, err := s.repo.GetBillGraph(ctx, billID, createInput.TenantID, createInput.StoreID)
+			if err != nil {
+				return CreateBillResponse{}, err
+			}
+			response = MapBillGraphToCreateBillResponse(graph)
+		}
 
 		if s.auditRecorder != nil {
 			if err := s.auditRecorder.RecordBillCreated(
@@ -463,6 +506,94 @@ func validateAuthoritativeStaffAssignments(
 	}
 
 	return nil
+}
+
+func buildInitialPaymentRows(
+	billID string,
+	calculation CalculationResult,
+	createdAt time.Time,
+) ([]InsertPaymentInput, string, error) {
+	rows := make([]InsertPaymentInput, 0, 2)
+	var onlinePaymentID string
+
+	switch calculation.PaymentMode {
+	case PaymentModeCash:
+		paymentID, err := newServiceUUIDString()
+		if err != nil {
+			return nil, "", paymentRowIDError("cash", err)
+		}
+		rows = append(rows, InsertPaymentInput{
+			ID:            paymentID,
+			BillID:        billID,
+			PaymentMethod: string(PaymentModeCash),
+			Amount:        calculation.Totals.TotalAmount,
+			Status:        string(enums.PaymentStatusSuccess),
+			VerifiedAt:    &createdAt,
+			CreatedAt:     createdAt,
+			UpdatedAt:     createdAt,
+		})
+	case PaymentModeOnline:
+		paymentID, err := newServiceUUIDString()
+		if err != nil {
+			return nil, "", paymentRowIDError("online", err)
+		}
+		gateway := "HDFC"
+		rows = append(rows, InsertPaymentInput{
+			ID:            paymentID,
+			BillID:        billID,
+			Gateway:       &gateway,
+			PaymentMethod: string(PaymentModeOnline),
+			Amount:        calculation.Totals.TotalAmount,
+			Status:        string(enums.PaymentStatusInitiated),
+			CreatedAt:     createdAt,
+			UpdatedAt:     createdAt,
+		})
+		onlinePaymentID = paymentID
+	case PaymentModeSplit:
+		cashPaymentID, err := newServiceUUIDString()
+		if err != nil {
+			return nil, "", paymentRowIDError("cash", err)
+		}
+		onlinePaymentID, err = newServiceUUIDString()
+		if err != nil {
+			return nil, "", paymentRowIDError("online", err)
+		}
+		gateway := "HDFC"
+		rows = append(rows,
+			InsertPaymentInput{
+				ID:            cashPaymentID,
+				BillID:        billID,
+				PaymentMethod: string(PaymentModeCash),
+				Amount:        calculation.Totals.AmountPaid,
+				Status:        string(enums.PaymentStatusSuccess),
+				VerifiedAt:    &createdAt,
+				CreatedAt:     createdAt,
+				UpdatedAt:     createdAt,
+			},
+			InsertPaymentInput{
+				ID:            onlinePaymentID,
+				BillID:        billID,
+				Gateway:       &gateway,
+				PaymentMethod: string(PaymentModeOnline),
+				Amount:        calculation.Totals.AmountDue,
+				Status:        string(enums.PaymentStatusInitiated),
+				CreatedAt:     createdAt,
+				UpdatedAt:     createdAt,
+			},
+		)
+	default:
+		return nil, "", apperrors.New(apperrors.CodeInvalidRequest, "payment.mode must be one of CASH, ONLINE, SPLIT")
+	}
+
+	return rows, onlinePaymentID, nil
+}
+
+func paymentRowIDError(paymentKind string, err error) error {
+	return apperrors.NewWithDetails(
+		apperrors.CodeInternalError,
+		"Failed to create "+paymentKind+" payment",
+		map[string]any{"reason": err.Error()},
+	)
 }
 
 func buildTipAllocationRows(

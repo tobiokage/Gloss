@@ -2,6 +2,7 @@ package billing
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -16,12 +17,21 @@ func CalculateBill(input CalculatorInput) (CalculationResult, error) {
 	lineGrossAmounts := make([]int64, len(input.Lines))
 	serviceGrossAmount := int64(0)
 	for i, line := range input.Lines {
-		gross := line.UnitPrice * line.Quantity
+		gross, err := checkedMul(line.UnitPrice, line.Quantity, "line gross amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
 		lineGrossAmounts[i] = gross
-		serviceGrossAmount += gross
+		serviceGrossAmount, err = checkedAdd(serviceGrossAmount, gross, "service gross amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
 	}
 
-	discounts := allocateDiscountByLargestRemainder(lineGrossAmounts, input.DiscountAmount, serviceGrossAmount)
+	discounts, err := allocateDiscountByLargestRemainder(lineGrossAmounts, input.DiscountAmount, serviceGrossAmount)
+	if err != nil {
+		return CalculationResult{}, err
+	}
 	calculatedLines := make([]CalculatedBillLine, 0, len(input.Lines))
 
 	serviceNetAmount := int64(0)
@@ -33,14 +43,32 @@ func CalculateBill(input CalculatorInput) (CalculationResult, error) {
 		lineGrossAmount := lineGrossAmounts[i]
 		lineDiscountAmount := discounts[i]
 		lineNetAmount := lineGrossAmount - lineDiscountAmount
-		taxableBaseAmount := (lineNetAmount * taxInclusiveBaseNumerator) / taxInclusiveBaseDivisor
+		taxableBaseAmount, err := checkedPercentFloor(lineNetAmount, taxInclusiveBaseNumerator, taxInclusiveBaseDivisor, "taxable base amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
 		taxAmount := lineNetAmount - taxableBaseAmount
-		commissionAmount := (lineNetAmount * commissionPercent) / 100
+		commissionAmount, err := checkedPercentFloor(lineNetAmount, commissionPercent, 100, "commission amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
 
-		serviceNetAmount += lineNetAmount
-		taxableBaseTotal += taxableBaseAmount
-		taxTotal += taxAmount
-		discountTotal += lineDiscountAmount
+		serviceNetAmount, err = checkedAdd(serviceNetAmount, lineNetAmount, "service net amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
+		taxableBaseTotal, err = checkedAdd(taxableBaseTotal, taxableBaseAmount, "taxable base amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
+		taxTotal, err = checkedAdd(taxTotal, taxAmount, "tax amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
+		discountTotal, err = checkedAdd(discountTotal, lineDiscountAmount, "discount amount")
+		if err != nil {
+			return CalculationResult{}, err
+		}
 
 		calculatedLines = append(calculatedLines, CalculatedBillLine{
 			CatalogueItemID:      line.CatalogueItemID,
@@ -58,8 +86,14 @@ func CalculateBill(input CalculatorInput) (CalculationResult, error) {
 		})
 	}
 
-	totalAmount := serviceNetAmount + input.TipAmount
-	amountPaid, amountDue := derivePaidAndDueAmounts(totalAmount, input.Payment)
+	totalAmount, err := checkedAdd(serviceNetAmount, input.TipAmount, "total amount")
+	if err != nil {
+		return CalculationResult{}, err
+	}
+	amountPaid, amountDue, err := derivePaidAndDueAmounts(totalAmount, input.Payment)
+	if err != nil {
+		return CalculationResult{}, err
+	}
 	status, err := DeriveCreateBillStatus(input.Payment.Mode)
 	if err != nil {
 		return CalculationResult{}, err
@@ -94,12 +128,12 @@ func DeriveCreateBillStatus(mode PaymentMode) (enums.BillStatus, error) {
 	switch mode {
 	case PaymentModeCash:
 		return enums.BillStatusPaid, nil
-	case PaymentModeUPI:
+	case PaymentModeOnline:
 		return enums.BillStatusPaymentPending, nil
 	case PaymentModeSplit:
 		return enums.BillStatusPartiallyPaid, nil
 	default:
-		return "", invalidRequest("payment.mode must be one of CASH, UPI, SPLIT")
+		return "", invalidRequest("payment.mode must be one of CASH, ONLINE, SPLIT")
 	}
 }
 
@@ -118,14 +152,14 @@ func FormatBillNumber(input BillNumberInput) (string, error) {
 	return fmt.Sprintf("%s-%s-%0*d", storeCode, input.Date.Format("20060102"), billNumberSequenceWidth, input.Sequence), nil
 }
 
-func maxDiscountAmount(serviceGrossAmount int64) int64 {
-	return (serviceGrossAmount * maxDiscountPercent) / 100
+func maxDiscountAmount(serviceGrossAmount int64) (int64, error) {
+	return checkedPercentFloor(serviceGrossAmount, maxDiscountPercent, 100, "max discount amount")
 }
 
-func allocateDiscountByLargestRemainder(lineGrossAmounts []int64, discountAmount int64, serviceGrossAmount int64) []int64 {
+func allocateDiscountByLargestRemainder(lineGrossAmounts []int64, discountAmount int64, serviceGrossAmount int64) ([]int64, error) {
 	allocations := make([]int64, len(lineGrossAmounts))
 	if discountAmount == 0 || len(lineGrossAmounts) == 0 || serviceGrossAmount == 0 {
-		return allocations
+		return allocations, nil
 	}
 
 	type remainderRow struct {
@@ -137,12 +171,18 @@ func allocateDiscountByLargestRemainder(lineGrossAmounts []int64, discountAmount
 	allocated := int64(0)
 
 	for i, lineGrossAmount := range lineGrossAmounts {
-		numerator := discountAmount * lineGrossAmount
+		numerator, err := checkedMul(discountAmount, lineGrossAmount, "discount allocation")
+		if err != nil {
+			return nil, err
+		}
 		baseAllocation := numerator / serviceGrossAmount
 		remainder := numerator % serviceGrossAmount
 
 		allocations[i] = baseAllocation
-		allocated += baseAllocation
+		allocated, err = checkedAdd(allocated, baseAllocation, "discount allocation")
+		if err != nil {
+			return nil, err
+		}
 		remainders = append(remainders, remainderRow{
 			index:     i,
 			remainder: remainder,
@@ -151,7 +191,7 @@ func allocateDiscountByLargestRemainder(lineGrossAmounts []int64, discountAmount
 
 	remaining := discountAmount - allocated
 	if remaining <= 0 {
-		return allocations
+		return allocations, nil
 	}
 
 	sort.SliceStable(remainders, func(i int, j int) bool {
@@ -163,19 +203,22 @@ func allocateDiscountByLargestRemainder(lineGrossAmounts []int64, discountAmount
 		allocations[target]++
 	}
 
-	return allocations
+	return allocations, nil
 }
 
-func derivePaidAndDueAmounts(totalAmount int64, payment PaymentInput) (int64, int64) {
+func derivePaidAndDueAmounts(totalAmount int64, payment PaymentInput) (int64, int64, error) {
 	switch payment.Mode {
 	case PaymentModeCash:
-		return totalAmount, 0
-	case PaymentModeUPI:
-		return 0, totalAmount
+		return totalAmount, 0, nil
+	case PaymentModeOnline:
+		return 0, totalAmount, nil
 	case PaymentModeSplit:
-		return payment.CashAmount, totalAmount - payment.CashAmount
+		if payment.CashAmount > totalAmount {
+			return 0, 0, invalidRequest("payment.cash_amount must be less than total_amount for SPLIT")
+		}
+		return payment.CashAmount, totalAmount - payment.CashAmount, nil
 	default:
-		return 0, totalAmount
+		return 0, totalAmount, nil
 	}
 }
 
@@ -193,8 +236,19 @@ func validateCalculationInvariants(result CalculationResult, lineDiscountTotal i
 	lineNetTotal := int64(0)
 	taxablePlusTaxTotal := int64(0)
 	for _, line := range result.Lines {
-		lineNetTotal += line.LineNetAmount
-		taxablePlusTaxTotal += line.TaxableBaseAmount + line.TaxAmount
+		var err error
+		lineNetTotal, err = checkedAdd(lineNetTotal, line.LineNetAmount, "line net amount")
+		if err != nil {
+			return err
+		}
+		lineTaxTotal, err := checkedAdd(line.TaxableBaseAmount, line.TaxAmount, "line tax total")
+		if err != nil {
+			return err
+		}
+		taxablePlusTaxTotal, err = checkedAdd(taxablePlusTaxTotal, lineTaxTotal, "tax total")
+		if err != nil {
+			return err
+		}
 	}
 
 	if lineNetTotal != result.Totals.ServiceNetAmount {
@@ -206,13 +260,21 @@ func validateCalculationInvariants(result CalculationResult, lineDiscountTotal i
 
 	tipTotal := int64(0)
 	for _, allocation := range result.TipAllocations {
-		tipTotal += allocation.TipAmount
+		var err error
+		tipTotal, err = checkedAdd(tipTotal, allocation.TipAmount, "tip amount")
+		if err != nil {
+			return err
+		}
 	}
 	if tipTotal != result.Totals.TipAmount {
 		return invalidRequest("invariant failed: sum of tip allocations must equal tip amount")
 	}
 
-	if result.Totals.AmountPaid+result.Totals.AmountDue != result.Totals.TotalAmount {
+	paidPlusDue, err := checkedAdd(result.Totals.AmountPaid, result.Totals.AmountDue, "payment amount")
+	if err != nil {
+		return err
+	}
+	if paidPlusDue != result.Totals.TotalAmount {
 		return invalidRequest("invariant failed: amount paid plus amount due must equal total amount")
 	}
 
@@ -232,4 +294,32 @@ func validateCalculationInvariants(result CalculationResult, lineDiscountTotal i
 	}
 
 	return nil
+}
+
+func checkedAdd(a int64, b int64, fieldName string) (int64, error) {
+	if (b > 0 && a > math.MaxInt64-b) || (b < 0 && a < math.MinInt64-b) {
+		return 0, invalidRequest(fieldName + " exceeds supported range")
+	}
+	return a + b, nil
+}
+
+func checkedMul(a int64, b int64, fieldName string) (int64, error) {
+	if a < 0 || b < 0 {
+		return 0, invalidRequest(fieldName + " cannot be negative")
+	}
+	if a != 0 && b > math.MaxInt64/a {
+		return 0, invalidRequest(fieldName + " exceeds supported range")
+	}
+	return a * b, nil
+}
+
+func checkedPercentFloor(amount int64, numerator int64, divisor int64, fieldName string) (int64, error) {
+	if divisor <= 0 {
+		return 0, invalidRequest(fieldName + " has invalid divisor")
+	}
+	product, err := checkedMul(amount, numerator, fieldName)
+	if err != nil {
+		return 0, err
+	}
+	return product / divisor, nil
 }

@@ -42,3 +42,33 @@ func (s *Service) RecordBillCreated(
 		Metadata:          metadata,
 	})
 }
+
+func (s *Service) RecordPaymentEvent(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	paymentID string,
+	performedByUserID string,
+	action string,
+	metadata map[string]any,
+) error {
+	tenantID = strings.TrimSpace(tenantID)
+	storeID = strings.TrimSpace(storeID)
+	paymentID = strings.TrimSpace(paymentID)
+	performedByUserID = strings.TrimSpace(performedByUserID)
+	action = strings.TrimSpace(action)
+
+	if tenantID == "" || paymentID == "" || action == "" {
+		return apperrors.New(apperrors.CodeInternalError, "Invalid audit log input")
+	}
+
+	return s.repo.Insert(ctx, RecordInput{
+		TenantID:          tenantID,
+		StoreID:           storeID,
+		EntityType:        "PAYMENT",
+		EntityID:          paymentID,
+		Action:            action,
+		PerformedByUserID: performedByUserID,
+		Metadata:          metadata,
+	})
+}

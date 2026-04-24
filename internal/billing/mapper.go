@@ -3,6 +3,8 @@ package billing
 import (
 	"strings"
 	"time"
+
+	"gloss/internal/shared/enums"
 )
 
 type AuthoritativeCatalogueLine struct {
@@ -84,11 +86,12 @@ func BuildCreateBillSuccessResponse(
 
 func MapBillGraphToCreateBillResponse(graph BillGraph) CreateBillResponse {
 	return CreateBillResponse{
-		Bill:           mapBillHeader(graph.Bill),
-		Items:          mapBillItems(graph.Items),
-		TipAllocations: mapTipAllocations(graph.TipAllocations),
-		Payments:       mapBillPayments(graph.Payments),
-		Receipt:        mapReceiptPayload(graph),
+		Bill:                mapBillHeader(graph.Bill),
+		Items:               mapBillItems(graph.Items),
+		TipAllocations:      mapTipAllocations(graph.TipAllocations),
+		Payments:            mapBillPayments(graph.Payments),
+		ActiveOnlinePayment: mapActiveOnlinePayment(graph.Payments),
+		Receipt:             mapReceiptPayload(graph),
 	}
 }
 
@@ -151,6 +154,7 @@ func mapBillPayments(payments []BillPaymentRecord) []CreatedBillPaymentResponse 
 	for _, payment := range payments {
 		response = append(response, CreatedBillPaymentResponse{
 			ID:            payment.ID,
+			Gateway:       payment.Gateway,
 			PaymentMethod: payment.PaymentMethod,
 			Amount:        payment.Amount,
 			Status:        payment.Status,
@@ -160,6 +164,43 @@ func mapBillPayments(payments []BillPaymentRecord) []CreatedBillPaymentResponse 
 		})
 	}
 	return response
+}
+
+func mapActiveOnlinePayment(payments []BillPaymentRecord) *ActiveOnlinePaymentResponse {
+	for _, payment := range payments {
+		if payment.PaymentMethod != string(PaymentModeOnline) {
+			continue
+		}
+		if payment.Gateway == nil || *payment.Gateway != "HDFC" {
+			continue
+		}
+		if payment.Status != "INITIATED" && payment.Status != "PENDING" {
+			continue
+		}
+
+		providerRequestID := ""
+		if payment.ProviderRequestID != nil {
+			providerRequestID = *payment.ProviderRequestID
+		}
+		canCancelAttempt := payment.Status == string(enums.PaymentStatusPending) &&
+			hasText(payment.ProviderTxnID) &&
+			hasText(payment.TerminalTID)
+
+		return &ActiveOnlinePaymentResponse{
+			PaymentID:         payment.ID,
+			Gateway:           "HDFC",
+			Status:            payment.Status,
+			TerminalFlow:      "HDFC_TERMINAL_OWNED",
+			ProviderRequestID: providerRequestID,
+			ProviderTxnID:     payment.ProviderTxnID,
+			CanCancelAttempt:  canCancelAttempt,
+		}
+	}
+	return nil
+}
+
+func hasText(value *string) bool {
+	return value != nil && strings.TrimSpace(*value) != ""
 }
 
 func mapReceiptPayload(graph BillGraph) ReceiptPayloadResponse {
@@ -259,6 +300,7 @@ func mapInsertedPayments(payments []InsertPaymentInput) []BillPaymentRecord {
 	for _, payment := range payments {
 		response = append(response, BillPaymentRecord{
 			ID:            payment.ID,
+			Gateway:       payment.Gateway,
 			PaymentMethod: payment.PaymentMethod,
 			Amount:        payment.Amount,
 			Status:        payment.Status,

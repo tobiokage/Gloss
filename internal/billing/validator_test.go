@@ -3,6 +3,8 @@ package billing
 import (
 	"strings"
 	"testing"
+
+	"gloss/internal/shared/enums"
 )
 
 func TestValidateCreateBillRequestRejectsMalformedUUIDs(t *testing.T) {
@@ -50,6 +52,52 @@ func TestValidateCreateBillRequestRejectsMalformedUUIDs(t *testing.T) {
 				t.Fatalf("expected UUID validation error for %s, got %v", tc.expectedField, err)
 			}
 		})
+	}
+}
+
+func TestValidateCreateBillRequestUsesOnlineVocabulary(t *testing.T) {
+	req := validCreateBillRequestForValidation()
+	req.Payment.Mode = string(PaymentModeOnline)
+
+	validated, err := ValidateCreateBillRequest(req)
+	if err != nil {
+		t.Fatalf("expected ONLINE to validate, got %v", err)
+	}
+	if validated.Payment.Mode != PaymentModeOnline {
+		t.Fatalf("expected payment mode %q, got %q", PaymentModeOnline, validated.Payment.Mode)
+	}
+
+	req.Payment.Mode = "UPI"
+	_, err = ValidateCreateBillRequest(req)
+	if err == nil {
+		t.Fatal("expected UPI to be rejected")
+	}
+	if !strings.Contains(err.Error(), "CASH, ONLINE, SPLIT") {
+		t.Fatalf("expected ONLINE vocabulary in validation error, got %v", err)
+	}
+}
+
+func TestCalculateBillOnlineStartsPaymentPending(t *testing.T) {
+	result, err := CalculateBill(CalculatorInput{
+		Lines: []AuthoritativeBillLineInput{
+			{
+				CatalogueItemID: "11111111-1111-1111-1111-111111111111",
+				ServiceName:     "Haircut",
+				AssignedStaffID: "22222222-2222-2222-2222-222222222222",
+				UnitPrice:       10500,
+				Quantity:        1,
+			},
+		},
+		Payment: PaymentInput{Mode: PaymentModeOnline},
+	})
+	if err != nil {
+		t.Fatalf("CalculateBill returned error: %v", err)
+	}
+	if result.Status != enums.BillStatusPaymentPending {
+		t.Fatalf("expected status %q, got %q", enums.BillStatusPaymentPending, result.Status)
+	}
+	if result.Totals.AmountPaid != 0 || result.Totals.AmountDue != result.Totals.TotalAmount {
+		t.Fatalf("unexpected online totals: paid=%d due=%d total=%d", result.Totals.AmountPaid, result.Totals.AmountDue, result.Totals.TotalAmount)
 	}
 }
 

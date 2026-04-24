@@ -23,7 +23,8 @@ SELECT
 	tenant_id::text,
 	name,
 	code,
-	location
+	location,
+	COALESCE(hdfc_terminal_tid, '')
 FROM stores
 WHERE id = $1
   AND tenant_id = $2
@@ -37,6 +38,7 @@ LIMIT 1`
 		&store.Name,
 		&store.Code,
 		&store.Location,
+		&store.HDFCTerminalTID,
 	)
 	if err != nil {
 		if stderrors.Is(err, sql.ErrNoRows) {

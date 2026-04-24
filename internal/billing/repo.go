@@ -442,17 +442,12 @@ INSERT INTO payments (
 	payment_method,
 	amount,
 	status,
-	gateway_order_id,
-	gateway_txn_id,
-	gateway_reference,
-	request_payload,
-	response_payload,
 	verified_at,
 	created_at,
 	updated_at
 )
 VALUES (
-	$1, $2, NULL, $3, $4, $5, NULL, NULL, NULL, NULL, NULL, $6, $7, $8
+	$1, $2, $3, $4, $5, $6, $7, $8, $9
 )`
 
 	if _, err := tx.ExecContext(
@@ -460,6 +455,7 @@ VALUES (
 		query,
 		input.ID,
 		input.BillID,
+		nullableString(input.Gateway),
 		input.PaymentMethod,
 		input.Amount,
 		input.Status,
@@ -698,6 +694,9 @@ SELECT
 	payment_method,
 	amount,
 	status,
+	provider_request_id,
+	provider_txn_id,
+	terminal_tid,
 	created_at,
 	updated_at,
 	verified_at
@@ -718,9 +717,12 @@ ORDER BY created_at ASC, id ASC`
 	payments := make([]BillPaymentRecord, 0)
 	for rows.Next() {
 		var (
-			payment    BillPaymentRecord
-			gateway    sql.NullString
-			verifiedAt sql.NullTime
+			payment           BillPaymentRecord
+			gateway           sql.NullString
+			providerRequestID sql.NullString
+			providerTxnID     sql.NullString
+			terminalTID       sql.NullString
+			verifiedAt        sql.NullTime
 		)
 		if err := rows.Scan(
 			&payment.ID,
@@ -728,6 +730,9 @@ ORDER BY created_at ASC, id ASC`
 			&payment.PaymentMethod,
 			&payment.Amount,
 			&payment.Status,
+			&providerRequestID,
+			&providerTxnID,
+			&terminalTID,
 			&payment.CreatedAt,
 			&payment.UpdatedAt,
 			&verifiedAt,
@@ -741,6 +746,18 @@ ORDER BY created_at ASC, id ASC`
 		if gateway.Valid {
 			gatewayValue := gateway.String
 			payment.Gateway = &gatewayValue
+		}
+		if providerRequestID.Valid {
+			providerRequestIDValue := providerRequestID.String
+			payment.ProviderRequestID = &providerRequestIDValue
+		}
+		if providerTxnID.Valid {
+			providerTxnIDValue := providerTxnID.String
+			payment.ProviderTxnID = &providerTxnIDValue
+		}
+		if terminalTID.Valid {
+			terminalTIDValue := terminalTID.String
+			payment.TerminalTID = &terminalTIDValue
 		}
 		if verifiedAt.Valid {
 			verifiedAtValue := verifiedAt.Time
@@ -757,6 +774,13 @@ ORDER BY created_at ASC, id ASC`
 	}
 
 	return payments, nil
+}
+
+func nullableString(value *string) any {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return nil
+	}
+	return *value
 }
 
 func buildInClause(startIndex int, values []string) (string, []any) {

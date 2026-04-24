@@ -11,6 +11,8 @@ var itemIDUUIDPattern = regexp.MustCompile(
 	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
 )
 
+const MaxCatalogueListPricePaise int64 = 100_000_000
+
 type ValidatedCatalogueItemInput struct {
 	Name      string
 	Category  string
@@ -28,8 +30,11 @@ func ValidateCatalogueItemInput(name string, category string, listPrice int64) (
 		return ValidatedCatalogueItemInput{}, apperrors.New(apperrors.CodeInvalidRequest, "category is required")
 	}
 
-	if listPrice <= 0 {
-		return ValidatedCatalogueItemInput{}, apperrors.New(apperrors.CodeInvalidRequest, "list_price must be greater than 0")
+	if listPrice < 0 {
+		return ValidatedCatalogueItemInput{}, apperrors.New(apperrors.CodeInvalidRequest, "list_price cannot be negative")
+	}
+	if listPrice > MaxCatalogueListPricePaise {
+		return ValidatedCatalogueItemInput{}, apperrors.New(apperrors.CodeInvalidRequest, "list_price exceeds maximum allowed amount")
 	}
 
 	return ValidatedCatalogueItemInput{

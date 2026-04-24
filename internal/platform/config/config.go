@@ -15,6 +15,7 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	DB              DBConfig
 	Auth            AuthConfig
+	HDFC            HDFCConfig
 }
 
 type DBConfig struct {
@@ -31,6 +32,14 @@ type AuthConfig struct {
 	JWTTTL    time.Duration
 }
 
+type HDFCConfig struct {
+	BaseURL            string
+	ClientAPIKey       string
+	ClientSecretKeyHex string
+	AuthorizationToken string
+	IV                 string
+}
+
 func Load() (Config, error) {
 	dbCfg, err := loadDBConfig()
 	if err != nil {
@@ -45,6 +54,13 @@ func Load() (Config, error) {
 		Auth: AuthConfig{
 			JWTSecret: os.Getenv("JWT_SECRET"),
 			JWTTTL:    60 * time.Minute,
+		},
+		HDFC: HDFCConfig{
+			BaseURL:            os.Getenv("HDFC_BASE_URL"),
+			ClientAPIKey:       os.Getenv("HDFC_CLIENT_API_KEY"),
+			ClientSecretKeyHex: os.Getenv("HDFC_CLIENT_SECRET_KEY"),
+			AuthorizationToken: os.Getenv("HDFC_AUTHORIZATION_TOKEN"),
+			IV:                 os.Getenv("HDFC_IV"),
 		},
 	}
 
@@ -137,9 +153,14 @@ func loadDBConfig() (DBConfig, error) {
 
 func validateRequired(cfg Config) error {
 	required := map[string]string{
-		"APP_ENV":    cfg.AppEnv,
-		"HTTP_PORT":  cfg.HTTPPort,
-		"JWT_SECRET": cfg.Auth.JWTSecret,
+		"APP_ENV":                  cfg.AppEnv,
+		"HTTP_PORT":                cfg.HTTPPort,
+		"JWT_SECRET":               cfg.Auth.JWTSecret,
+		"HDFC_BASE_URL":            cfg.HDFC.BaseURL,
+		"HDFC_CLIENT_API_KEY":      cfg.HDFC.ClientAPIKey,
+		"HDFC_CLIENT_SECRET_KEY":   cfg.HDFC.ClientSecretKeyHex,
+		"HDFC_AUTHORIZATION_TOKEN": cfg.HDFC.AuthorizationToken,
+		"HDFC_IV":                  cfg.HDFC.IV,
 	}
 
 	for key, value := range required {

@@ -23,18 +23,26 @@ func WriteError(w nethttp.ResponseWriter, err error) {
 		appErr = apperrors.New(apperrors.CodeInternalError, "Internal server error")
 	}
 
-	details := appErr.Details
-	if details == nil {
-		details = map[string]any{}
-	}
+	statusCode := statusFromCode(appErr.Code)
+	details := sanitizeErrorDetails(statusCode, appErr.Details)
 
-	WriteJSON(w, statusFromCode(appErr.Code), errorEnvelope{
+	WriteJSON(w, statusCode, errorEnvelope{
 		Error: errorBody{
 			Code:    string(appErr.Code),
 			Message: appErr.Message,
 			Details: details,
 		},
 	})
+}
+
+func sanitizeErrorDetails(statusCode int, details map[string]any) map[string]any {
+	if statusCode >= nethttp.StatusInternalServerError {
+		return map[string]any{}
+	}
+	if details == nil {
+		return map[string]any{}
+	}
+	return details
 }
 
 func statusFromCode(code apperrors.Code) int {

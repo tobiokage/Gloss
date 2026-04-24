@@ -9,9 +9,9 @@ import (
 type PaymentMode string
 
 const (
-	PaymentModeCash  PaymentMode = "CASH"
-	PaymentModeUPI   PaymentMode = "UPI"
-	PaymentModeSplit PaymentMode = "SPLIT"
+	PaymentModeCash   PaymentMode = "CASH"
+	PaymentModeOnline PaymentMode = "ONLINE"
+	PaymentModeSplit  PaymentMode = "SPLIT"
 )
 
 const (
@@ -20,6 +20,13 @@ const (
 	taxInclusiveBaseNumerator int64 = 100
 	taxInclusiveBaseDivisor   int64 = 105
 	billNumberSequenceWidth         = 6
+)
+
+const (
+	MaxBillLineUnitPricePaise int64 = 100_000_000
+	MaxBillItemQuantity       int64 = 1_000
+	MaxBillTipAmountPaise     int64 = 10_000_000
+	MaxBillTotalAmountPaise   int64 = 100_000_000
 )
 
 // AuthoritativeBillLineInput must be built from backend-verified catalogue data.
@@ -143,14 +150,17 @@ type BillTipAllocationRecord struct {
 }
 
 type BillPaymentRecord struct {
-	ID            string
-	Gateway       *string
-	PaymentMethod string
-	Amount        int64
-	Status        string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	VerifiedAt    *time.Time
+	ID                string
+	Gateway           *string
+	PaymentMethod     string
+	Amount            int64
+	Status            string
+	ProviderRequestID *string
+	ProviderTxnID     *string
+	TerminalTID       *string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	VerifiedAt        *time.Time
 }
 
 type BillGraph struct {
@@ -230,6 +240,7 @@ type InsertCommissionLedgerInput struct {
 type InsertPaymentInput struct {
 	ID            string
 	BillID        string
+	Gateway       *string
 	PaymentMethod string
 	Amount        int64
 	Status        string

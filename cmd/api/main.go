@@ -15,6 +15,8 @@ import (
 	"gloss/internal/billing"
 	"gloss/internal/bootstrap"
 	"gloss/internal/catalogue"
+	"gloss/internal/payments"
+	"gloss/internal/payments/hdfc"
 	platformconfig "gloss/internal/platform/config"
 	platformdb "gloss/internal/platform/db"
 	platformhttp "gloss/internal/platform/http"
@@ -51,13 +53,16 @@ func main() {
 	authService := auth.NewService(cfg, authRepo)
 	authHandler := auth.NewHandler(authService)
 	bootstrapRepo := bootstrap.NewRepo(db)
-	bootstrapService := bootstrap.NewService(bootstrapRepo)
+	bootstrapService := bootstrap.NewService(bootstrapRepo, true)
 	bootstrapHandler := bootstrap.NewHandler(bootstrapService)
 	auditRepo := audit.NewRepo(db)
 	auditService := audit.NewService(auditRepo)
 	idempotencyStore := idempotency.NewStore()
+	hdfcClient := hdfc.NewClient(cfg.HDFC, nil)
+	paymentsRepo := payments.NewRepo(db)
+	paymentsService := payments.NewService(paymentsRepo, hdfcClient, auditService, logger.With("module", "payments"))
 	billingRepo := billing.NewRepo(db)
-	billingService := billing.NewService(db, billingRepo, idempotencyStore, auditService, logger.With("module", "billing"))
+	billingService := billing.NewService(db, billingRepo, idempotencyStore, auditService, logger.With("module", "billing"), paymentsService)
 	billingHandler := billing.NewHandler(billingService)
 	catalogueRepo := catalogue.NewRepo(db)
 	catalogueService := catalogue.NewService(catalogueRepo)

@@ -2,16 +2,18 @@ package bootstrap
 
 import (
 	"context"
+	"strings"
 
 	apperrors "gloss/internal/shared/errors"
 )
 
 type Service struct {
-	repo *Repo
+	repo              *Repo
+	hdfcOnlineEnabled bool
 }
 
-func NewService(repo *Repo) *Service {
-	return &Service{repo: repo}
+func NewService(repo *Repo, hdfcOnlineEnabled bool) *Service {
+	return &Service{repo: repo, hdfcOnlineEnabled: hdfcOnlineEnabled}
 }
 
 func (s *Service) GetStoreBootstrap(ctx context.Context, tenantID string, storeID string) (BootstrapResponse, error) {
@@ -35,8 +37,31 @@ func (s *Service) GetStoreBootstrap(ctx context.Context, tenantID string, storeI
 	}
 
 	return BootstrapResponse{
-		Store:          store,
-		CatalogueItems: catalogueItems,
-		Staff:          staffList,
+		Store:               store,
+		CatalogueItems:      catalogueItems,
+		Staff:               staffList,
+		PaymentCapabilities: buildPaymentCapabilities(store.HDFCTerminalTID, s.hdfcOnlineEnabled),
 	}, nil
+}
+
+func buildPaymentCapabilities(tid string, hdfcOnlineEnabled bool) PaymentCapabilitiesDTO {
+	tid = strings.TrimSpace(tid)
+	hasTerminalConfig := len(tid) == 8
+	modes := []string{"CASH"}
+	if hdfcOnlineEnabled && hasTerminalConfig {
+		modes = append(modes, "ONLINE", "SPLIT")
+	}
+
+	var indicator *string
+	if hasTerminalConfig {
+		masked := "****" + tid[len(tid)-4:]
+		indicator = &masked
+	}
+
+	return PaymentCapabilitiesDTO{
+		HDFCOnlineEnabled:     hdfcOnlineEnabled,
+		HasHDFCTerminalConfig: hasTerminalConfig,
+		AvailablePaymentModes: modes,
+		TerminalTIDIndicator:  indicator,
+	}
 }

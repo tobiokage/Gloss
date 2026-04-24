@@ -129,6 +129,7 @@ SELECT
 FROM staff
 WHERE id = $1
   AND tenant_id = $2
+  AND active = TRUE
 LIMIT 1`
 
 	var member Staff

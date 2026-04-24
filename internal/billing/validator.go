@@ -40,6 +40,9 @@ func ValidateCreateBillRequest(req CreateBillRequest) (ValidatedCreateBillReques
 		if item.Quantity <= 0 {
 			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].quantity must be greater than 0")
 		}
+		if item.Quantity > MaxBillItemQuantity {
+			return ValidatedCreateBillRequest{}, invalidRequest("items[" + itoa(i) + "].quantity exceeds maximum allowed quantity")
+		}
 		assignedStaffID, err := validateCreateBillUUID("items["+itoa(i)+"].assigned_staff_id", item.AssignedStaffID)
 		if err != nil {
 			return ValidatedCreateBillRequest{}, err
@@ -66,6 +69,9 @@ func ValidateCreateBillRequest(req CreateBillRequest) (ValidatedCreateBillReques
 	}
 	if tipAmount < 0 {
 		return ValidatedCreateBillRequest{}, invalidRequest("tip_amount cannot be negative")
+	}
+	if tipAmount > MaxBillTipAmountPaise {
+		return ValidatedCreateBillRequest{}, invalidRequest("tip_amount exceeds maximum allowed amount")
 	}
 
 	payment, err := validateAndNormalizePayment(req.Payment)
@@ -107,13 +113,29 @@ func ValidateCalculatorInput(input CalculatorInput) error {
 		if strings.TrimSpace(line.AssignedStaffID) == "" {
 			return invalidRequest("authoritative_lines[" + itoa(i) + "].assigned_staff_id is required")
 		}
-		if line.UnitPrice <= 0 {
-			return invalidRequest("authoritative_lines[" + itoa(i) + "].unit_price must be greater than 0")
+		if line.UnitPrice < 0 {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].unit_price cannot be negative")
+		}
+		if line.UnitPrice > MaxBillLineUnitPricePaise {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].unit_price exceeds maximum allowed amount")
 		}
 		if line.Quantity <= 0 {
 			return invalidRequest("authoritative_lines[" + itoa(i) + "].quantity must be greater than 0")
 		}
-		serviceGrossAmount += line.UnitPrice * line.Quantity
+		if line.Quantity > MaxBillItemQuantity {
+			return invalidRequest("authoritative_lines[" + itoa(i) + "].quantity exceeds maximum allowed quantity")
+		}
+		lineGrossAmount, err := checkedMul(line.UnitPrice, line.Quantity, "line gross amount")
+		if err != nil {
+			return err
+		}
+		serviceGrossAmount, err = checkedAdd(serviceGrossAmount, lineGrossAmount, "service gross amount")
+		if err != nil {
+			return err
+		}
+		if serviceGrossAmount > MaxBillTotalAmountPaise {
+			return invalidRequest("service subtotal exceeds maximum bill amount")
+		}
 	}
 
 	if input.DiscountAmount < 0 {
@@ -122,8 +144,14 @@ func ValidateCalculatorInput(input CalculatorInput) error {
 	if input.TipAmount < 0 {
 		return invalidRequest("tip_amount cannot be negative")
 	}
+	if input.TipAmount > MaxBillTipAmountPaise {
+		return invalidRequest("tip_amount exceeds maximum allowed amount")
+	}
 
-	maxDiscount := maxDiscountAmount(serviceGrossAmount)
+	maxDiscount, err := maxDiscountAmount(serviceGrossAmount)
+	if err != nil {
+		return err
+	}
 	if input.DiscountAmount > maxDiscount {
 		return invalidRequest("discount_amount exceeds 30% cap of service subtotal")
 	}
@@ -132,9 +160,16 @@ func ValidateCalculatorInput(input CalculatorInput) error {
 		return err
 	}
 
-	totalAmount := serviceGrossAmount - input.DiscountAmount + input.TipAmount
+	serviceNetAmount := serviceGrossAmount - input.DiscountAmount
+	totalAmount, err := checkedAdd(serviceNetAmount, input.TipAmount, "total amount")
+	if err != nil {
+		return err
+	}
 	if totalAmount <= 0 {
 		return invalidRequest("total_amount must be greater than 0")
+	}
+	if totalAmount > MaxBillTotalAmountPaise {
+		return invalidRequest("total_amount exceeds maximum bill amount")
 	}
 
 	if _, err := validatePaymentMode(input.Payment.Mode); err != nil {
@@ -180,10 +215,10 @@ func validateAndNormalizePayment(payment CreateBillPaymentRequest) (PaymentInput
 
 func validatePaymentMode(mode PaymentMode) (PaymentMode, error) {
 	switch mode {
-	case PaymentModeCash, PaymentModeUPI, PaymentModeSplit:
+	case PaymentModeCash, PaymentModeOnline, PaymentModeSplit:
 		return mode, nil
 	default:
-		return "", invalidRequest("payment.mode must be one of CASH, UPI, SPLIT")
+		return "", invalidRequest("payment.mode must be one of CASH, ONLINE, SPLIT")
 	}
 }
 
@@ -236,7 +271,14 @@ func validateTipAllocations(allocations []TipAllocation, tipAmount int64) error 
 		if allocation.TipAmount < 0 {
 			return invalidRequest("tip_allocations[" + itoa(i) + "].tip_amount cannot be negative")
 		}
-		allocationTotal += allocation.TipAmount
+		if allocation.TipAmount > MaxBillTipAmountPaise {
+			return invalidRequest("tip_allocations[" + itoa(i) + "].tip_amount exceeds maximum allowed amount")
+		}
+		var addErr error
+		allocationTotal, addErr = checkedAdd(allocationTotal, allocation.TipAmount, "tip allocation amount")
+		if addErr != nil {
+			return addErr
+		}
 	}
 
 	if allocationTotal != tipAmount {

@@ -29,11 +29,12 @@ type CreateBillPaymentRequest struct {
 }
 
 type CreateBillResponse struct {
-	Bill           CreatedBillHeaderResponse          `json:"bill"`
-	Items          []CreatedBillItemResponse          `json:"items"`
-	TipAllocations []CreatedBillTipAllocationResponse `json:"tip_allocations"`
-	Payments       []CreatedBillPaymentResponse       `json:"payments"`
-	Receipt        ReceiptPayloadResponse             `json:"receipt"`
+	Bill                CreatedBillHeaderResponse          `json:"bill"`
+	Items               []CreatedBillItemResponse          `json:"items"`
+	TipAllocations      []CreatedBillTipAllocationResponse `json:"tip_allocations"`
+	Payments            []CreatedBillPaymentResponse       `json:"payments"`
+	ActiveOnlinePayment *ActiveOnlinePaymentResponse       `json:"active_online_payment,omitempty"`
+	Receipt             ReceiptPayloadResponse             `json:"receipt"`
 }
 
 type CreatedBillHeaderResponse struct {
@@ -78,12 +79,23 @@ type CreatedBillTipAllocationResponse struct {
 
 type CreatedBillPaymentResponse struct {
 	ID            string     `json:"id"`
+	Gateway       *string    `json:"gateway,omitempty"`
 	PaymentMethod string     `json:"payment_method"`
 	Amount        int64      `json:"amount"`
 	Status        string     `json:"status"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 	VerifiedAt    *time.Time `json:"verified_at,omitempty"`
+}
+
+type ActiveOnlinePaymentResponse struct {
+	PaymentID         string  `json:"payment_id"`
+	Gateway           string  `json:"gateway"`
+	Status            string  `json:"status"`
+	TerminalFlow      string  `json:"terminal_flow"`
+	ProviderRequestID string  `json:"provider_request_id"`
+	ProviderTxnID     *string `json:"provider_txn_id,omitempty"`
+	CanCancelAttempt  bool    `json:"can_cancel_attempt"`
 }
 
 type ReceiptPayloadResponse struct {

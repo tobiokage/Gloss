@@ -51,6 +51,9 @@ func TestCreateBillCashAndIdempotencyReplay(t *testing.T) {
 	if len(response.Payments) != 1 {
 		t.Fatalf("expected 1 payment row, got %d", len(response.Payments))
 	}
+	if response.ActiveOnlinePayment != nil {
+		t.Fatal("cash bill must not return active_online_payment")
+	}
 	if response.Payments[0].PaymentMethod != string(PaymentModeCash) {
 		t.Fatalf("expected payment method %q, got %q", PaymentModeCash, response.Payments[0].PaymentMethod)
 	}
@@ -83,6 +86,193 @@ func TestCreateBillCashAndIdempotencyReplay(t *testing.T) {
 	}
 }
 
+func TestCreateBillCashDoesNotCallOnlinePaymentCoordinator(t *testing.T) {
+	state := newBillingServiceTestState()
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	_, err := service.CreateBill(context.Background(), billingTestAuthContext(), billingTestCreateBillRequest("idem-cash-no-hdfc"))
+	if err != nil {
+		t.Fatalf("CreateBill returned error: %v", err)
+	}
+	if coordinator.ensureCalls != 0 || coordinator.initiateCalls != 0 {
+		t.Fatalf("cash bill must not use HDFC coordinator, got ensure=%d initiate=%d", coordinator.ensureCalls, coordinator.initiateCalls)
+	}
+}
+
+func TestCreateBillOnlinePersistsHDFCPaymentAndInitiatesAfterCommit(t *testing.T) {
+	state := newBillingServiceTestState()
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{state: state}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	req := billingTestCreateBillRequest("idem-online")
+	req.Payment.Mode = string(PaymentModeOnline)
+
+	response, err := service.CreateBill(context.Background(), billingTestAuthContext(), req)
+	if err != nil {
+		t.Fatalf("CreateBill returned error: %v", err)
+	}
+
+	if response.Bill.Status != string(enums.BillStatusPaymentPending) {
+		t.Fatalf("expected bill status %q, got %q", enums.BillStatusPaymentPending, response.Bill.Status)
+	}
+	if response.Bill.AmountPaid != 0 || response.Bill.AmountDue != response.Bill.TotalAmount {
+		t.Fatalf("unexpected online totals: paid=%d due=%d total=%d", response.Bill.AmountPaid, response.Bill.AmountDue, response.Bill.TotalAmount)
+	}
+	if len(response.Payments) != 1 {
+		t.Fatalf("expected one HDFC payment row, got %d", len(response.Payments))
+	}
+	if response.Payments[0].Gateway == nil || *response.Payments[0].Gateway != "HDFC" {
+		t.Fatalf("expected HDFC gateway, got %#v", response.Payments[0].Gateway)
+	}
+	if response.Payments[0].PaymentMethod != string(PaymentModeOnline) || response.Payments[0].Status != string(enums.PaymentStatusInitiated) {
+		t.Fatalf("unexpected online payment row: %#v", response.Payments[0])
+	}
+	if response.ActiveOnlinePayment == nil {
+		t.Fatal("expected active_online_payment for online bill")
+	}
+	if response.ActiveOnlinePayment.TerminalFlow != "HDFC_TERMINAL_OWNED" {
+		t.Fatalf("unexpected terminal flow: %s", response.ActiveOnlinePayment.TerminalFlow)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("failed to encode response: %v", err)
+	}
+	if strings.Contains(strings.ToLower(string(encoded)), "qr") {
+		t.Fatalf("response must not contain QR payload fields: %s", string(encoded))
+	}
+	if coordinator.ensureCalls != 1 || coordinator.initiateCalls != 1 {
+		t.Fatalf("expected ensure and initiate once, got ensure=%d initiate=%d", coordinator.ensureCalls, coordinator.initiateCalls)
+	}
+	if !coordinator.initiatedAfterCommit {
+		t.Fatal("expected HDFC initiation after bill and payment rows were inserted")
+	}
+}
+
+func TestCreateBillOnlineIdempotencyReplaySkipsMutableReadinessCheck(t *testing.T) {
+	state := newBillingServiceTestState()
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{state: state}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	req := billingTestCreateBillRequest("idem-online-replay")
+	req.Payment.Mode = string(PaymentModeOnline)
+
+	response, err := service.CreateBill(context.Background(), billingTestAuthContext(), req)
+	if err != nil {
+		t.Fatalf("CreateBill returned error: %v", err)
+	}
+
+	coordinator.ensureErr = errors.New("terminal tid changed")
+	replayedResponse, err := service.CreateBill(context.Background(), billingTestAuthContext(), req)
+	if err != nil {
+		t.Fatalf("CreateBill replay returned error despite mutable readiness failure: %v", err)
+	}
+	if replayedResponse.Bill.ID != response.Bill.ID {
+		t.Fatalf("expected replay bill %q, got %q", response.Bill.ID, replayedResponse.Bill.ID)
+	}
+	if coordinator.ensureCalls != 1 {
+		t.Fatalf("expected readiness check only for original create, got %d calls", coordinator.ensureCalls)
+	}
+	if coordinator.initiateCalls != 1 {
+		t.Fatalf("expected HDFC initiation only for original create, got %d calls", coordinator.initiateCalls)
+	}
+}
+
+func TestCreateBillSplitPersistsCashAndOnlineRows(t *testing.T) {
+	state := newBillingServiceTestState()
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{state: state}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	cashAmount := int64(5000)
+	req := billingTestCreateBillRequest("idem-split")
+	req.Payment.Mode = string(PaymentModeSplit)
+	req.Payment.CashAmount = &cashAmount
+
+	response, err := service.CreateBill(context.Background(), billingTestAuthContext(), req)
+	if err != nil {
+		t.Fatalf("CreateBill returned error: %v", err)
+	}
+
+	if response.Bill.Status != string(enums.BillStatusPartiallyPaid) {
+		t.Fatalf("expected bill status %q, got %q", enums.BillStatusPartiallyPaid, response.Bill.Status)
+	}
+	if len(response.Payments) != 2 {
+		t.Fatalf("expected cash + online payment rows, got %d", len(response.Payments))
+	}
+	if response.Payments[0].PaymentMethod != string(PaymentModeCash) || response.Payments[0].Status != string(enums.PaymentStatusSuccess) {
+		t.Fatalf("unexpected cash row: %#v", response.Payments[0])
+	}
+	if response.Payments[1].Gateway == nil || *response.Payments[1].Gateway != "HDFC" {
+		t.Fatalf("expected HDFC online row, got %#v", response.Payments[1])
+	}
+	if response.Payments[1].Amount != response.Bill.AmountDue {
+		t.Fatalf("expected online row amount %d, got %d", response.Bill.AmountDue, response.Payments[1].Amount)
+	}
+	if coordinator.initiateCalls != 1 {
+		t.Fatalf("expected one HDFC initiation, got %d", coordinator.initiateCalls)
+	}
+}
+
+func TestCreateBillOnlineMissingTerminalConfigBlocksBeforeProviderCall(t *testing.T) {
+	state := newBillingServiceTestState()
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{ensureErr: errors.New("missing tid")}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	req := billingTestCreateBillRequest("idem-online-missing-tid")
+	req.Payment.Mode = string(PaymentModeOnline)
+
+	_, err := service.CreateBill(context.Background(), billingTestAuthContext(), req)
+	if err == nil {
+		t.Fatal("expected missing terminal config to block online create")
+	}
+	if coordinator.initiateCalls != 0 {
+		t.Fatalf("provider call must not be attempted, got %d calls", coordinator.initiateCalls)
+	}
+	if state.billInsertCount != 0 || state.paymentInsertCount != 0 {
+		t.Fatalf("expected no committed rows, got bill inserts=%d payment inserts=%d", state.billInsertCount, state.paymentInsertCount)
+	}
+}
+
 func TestCreateBillAuditFailureDoesNotFailCommittedBill(t *testing.T) {
 	state := newBillingServiceTestState()
 	db := openBillingServiceTestDB(t, state)
@@ -110,12 +300,12 @@ func TestCreateBillAuditFailureDoesNotFailCommittedBill(t *testing.T) {
 	}
 }
 
-func TestCreateBillRequestDecodeRejectsUPIGateway(t *testing.T) {
+func TestCreateBillRequestDecodeRejectsGatewayField(t *testing.T) {
 	payload := `{
 		"client_bill_ref":"tablet-1",
 		"items":[{"catalogue_item_id":"cat-1","quantity":1,"assigned_staff_id":"staff-1"}],
-		"payment":{"mode":"CASH","upi_gateway":"PAYTM"},
-		"idempotency_key":"idem-upi"
+		"payment":{"mode":"CASH","gateway":"HDFC"},
+		"idempotency_key":"idem-gateway"
 	}`
 
 	var req CreateBillRequest
@@ -123,16 +313,45 @@ func TestCreateBillRequestDecodeRejectsUPIGateway(t *testing.T) {
 	decoder.DisallowUnknownFields()
 	err := decoder.Decode(&req)
 	if err == nil {
-		t.Fatal("expected decode error for unknown upi_gateway field")
+		t.Fatal("expected decode error for unknown gateway field")
 	}
-	if !strings.Contains(err.Error(), "upi_gateway") {
-		t.Fatalf("expected decode error to mention upi_gateway, got %v", err)
+	if !strings.Contains(err.Error(), "gateway") {
+		t.Fatalf("expected decode error to mention gateway, got %v", err)
 	}
 }
 
 type billingTestAuditRecorder struct {
 	calls int
 	err   error
+}
+
+type billingTestOnlinePaymentCoordinator struct {
+	state                *billingServiceTestState
+	ensureCalls          int
+	initiateCalls        int
+	initiatedAfterCommit bool
+	ensureErr            error
+	initiateErr          error
+}
+
+func (c *billingTestOnlinePaymentCoordinator) EnsureStoreReadyForOnline(context.Context, string, string) error {
+	c.ensureCalls++
+	return c.ensureErr
+}
+
+func (c *billingTestOnlinePaymentCoordinator) InitiateBillOnlinePayment(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ string,
+	_ string,
+	_ string,
+) error {
+	c.initiateCalls++
+	if c.state != nil {
+		c.initiatedAfterCommit = c.state.billInsertCount > 0 && c.state.paymentInsertCount > 0
+	}
+	return c.initiateErr
 }
 
 func (r *billingTestAuditRecorder) RecordBillCreated(
@@ -431,12 +650,13 @@ func (s *billingServiceTestState) execInsertPayment(args []any) (driver.Result, 
 	billID := billingServiceTestString(args[1])
 	s.payments[billID] = append(s.payments[billID], BillPaymentRecord{
 		ID:            billingServiceTestString(args[0]),
-		PaymentMethod: billingServiceTestString(args[2]),
-		Amount:        billingServiceTestInt64(args[3]),
-		Status:        billingServiceTestString(args[4]),
-		VerifiedAt:    billingServiceTestOptionalTime(args[5]),
-		CreatedAt:     billingServiceTestTime(args[6]),
-		UpdatedAt:     billingServiceTestTime(args[7]),
+		Gateway:       billingServiceTestOptionalString(args[2]),
+		PaymentMethod: billingServiceTestString(args[3]),
+		Amount:        billingServiceTestInt64(args[4]),
+		Status:        billingServiceTestString(args[5]),
+		VerifiedAt:    billingServiceTestOptionalTime(args[6]),
+		CreatedAt:     billingServiceTestTime(args[7]),
+		UpdatedAt:     billingServiceTestTime(args[8]),
 	})
 	s.paymentInsertCount++
 	return driver.RowsAffected(1), nil
@@ -652,6 +872,9 @@ func (s *billingServiceTestState) queryPayments(args []any) (driver.Rows, error)
 			payment.PaymentMethod,
 			payment.Amount,
 			payment.Status,
+			nil,
+			nil,
+			nil,
 			payment.CreatedAt,
 			payment.UpdatedAt,
 			verifiedAt,
@@ -659,7 +882,7 @@ func (s *billingServiceTestState) queryPayments(args []any) (driver.Rows, error)
 	}
 
 	return &billingServiceTestRows{
-		columns: []string{"id", "gateway", "payment_method", "amount", "status", "created_at", "updated_at", "verified_at"},
+		columns: []string{"id", "gateway", "payment_method", "amount", "status", "provider_request_id", "provider_txn_id", "terminal_tid", "created_at", "updated_at", "verified_at"},
 		values:  rows,
 	}, nil
 }
@@ -702,6 +925,21 @@ func billingServiceTestString(value any) string {
 		return typed
 	default:
 		return fmt.Sprint(typed)
+	}
+}
+
+func billingServiceTestOptionalString(value any) *string {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		value := typed
+		return &value
+	case *string:
+		return typed
+	default:
+		value := fmt.Sprint(typed)
+		return &value
 	}
 }
 
