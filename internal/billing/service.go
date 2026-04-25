@@ -73,6 +73,16 @@ type onlinePaymentAttemptCanceller interface {
 	) error
 }
 
+type onlinePaymentStatusSynchronizer interface {
+	SyncPendingBillPaymentStatus(
+		ctx context.Context,
+		tenantID string,
+		storeID string,
+		billID string,
+		performedByUserID string,
+	) error
+}
+
 type Service struct {
 	db               *sql.DB
 	repo             *Repo
@@ -467,6 +477,20 @@ func (s *Service) GetBill(ctx context.Context, authCtx auth.AuthContext, billID 
 	}
 
 	graph, err := s.repo.GetBillGraph(ctx, billID, scope.TenantID, scope.StoreID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	if graph.Bill.Status == string(enums.BillStatusCancelled) {
+		return MapBillGraphToCreateBillResponse(graph), nil
+	}
+
+	if synchronizer, ok := s.payments.(onlinePaymentStatusSynchronizer); ok && synchronizer != nil {
+		if err := synchronizer.SyncPendingBillPaymentStatus(ctx, scope.TenantID, scope.StoreID, billID, scope.UserID); err != nil {
+			return CreateBillResponse{}, err
+		}
+	}
+
+	graph, err = s.repo.GetBillGraph(ctx, billID, scope.TenantID, scope.StoreID)
 	if err != nil {
 		return CreateBillResponse{}, err
 	}

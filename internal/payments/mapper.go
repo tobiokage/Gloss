@@ -17,3 +17,7 @@ func mapHDFCSaleInitiationStatus(response hdfc.TransactionResponse) (string, boo
 		return string(enums.PaymentStatusPending), false
 	}
 }
+
+func mapHDFCStatusSyncStatus(response hdfc.TransactionResponse) string {
+	return string(hdfc.MapTxnStatus(response.TxnStatus))
+}

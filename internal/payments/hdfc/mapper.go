@@ -2,15 +2,17 @@ package hdfc
 
 import (
 	"fmt"
+	"strings"
 
 	"gloss/internal/shared/enums"
 )
 
 const (
-	TxnStatusInProgress = "InProgress"
-	TxnStatusSuccess    = "Success"
-	TxnStatusFailed     = "Failed"
-	TxnStatusCanceled   = "Canceled"
+	TxnStatusInProgress        = "In Progress"
+	txnStatusInProgressCompact = "InProgress"
+	TxnStatusSuccess           = "Success"
+	TxnStatusFailed            = "Failed"
+	TxnStatusCanceled          = "Canceled"
 )
 
 func FormatRupeeAmount(amountPaise int64) string {
@@ -23,8 +25,8 @@ func FormatRupeeAmount(amountPaise int64) string {
 }
 
 func MapTxnStatus(txnStatus string) enums.PaymentStatus {
-	switch txnStatus {
-	case TxnStatusInProgress:
+	switch strings.TrimSpace(txnStatus) {
+	case TxnStatusInProgress, txnStatusInProgressCompact:
 		return enums.PaymentStatusPending
 	case TxnStatusSuccess:
 		return enums.PaymentStatusSuccess
@@ -35,6 +37,17 @@ func MapTxnStatus(txnStatus string) enums.PaymentStatus {
 	default:
 		return enums.PaymentStatusPending
 	}
+}
+
+func ActualCompletionMode(response TransactionResponse) string {
+	if len(response.PaymentStatusDetail) == 0 {
+		return ""
+	}
+	value, ok := response.PaymentStatusDetail[0]["paymentMode"]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func BuildCreateSalePayload(req CreateSaleRequest) map[string]any {

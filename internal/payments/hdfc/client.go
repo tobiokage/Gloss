@@ -70,7 +70,7 @@ func (c *Client) postEncrypted(ctx context.Context, path string, tid string, inn
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("bh_client_apikey", c.cfg.ClientAPIKey)
 	httpReq.Header.Set("bh_client_traceid", c.traceID())
-	httpReq.Header.Set("bh_client_timestamp", c.now().Format(time.RFC3339))
+	httpReq.Header.Set("bh_client_timestamp", c.now().Format("20060102150405"))
 	httpReq.Header.Set("authorizationToken", c.cfg.AuthorizationToken)
 
 	resp, err := c.httpClient.Do(httpReq)

@@ -411,6 +411,95 @@ func TestRetryOnlinePaymentAuditsCommittedRetryBeforeHDFCFailure(t *testing.T) {
 	}
 }
 
+func TestGetBillTriggersPendingPaymentStatusSyncBeforeResponse(t *testing.T) {
+	state := newBillingServiceTestState()
+	billID := "77777777-7777-4777-8777-777777777777"
+	state.addStoredBill(billID, string(enums.BillStatusPaymentPending), string(PaymentModeOnline), 0, 10500)
+	gateway := "HDFC"
+	state.payments[billID] = []BillPaymentRecord{{
+		ID:            "88888888-8888-4888-8888-888888888888",
+		Gateway:       &gateway,
+		PaymentMethod: string(PaymentModeOnline),
+		Amount:        10500,
+		Status:        string(enums.PaymentStatusPending),
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}}
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{
+		syncFn: func() {
+			bill := state.bills[billID]
+			bill.Status = string(enums.BillStatusPaid)
+			bill.AmountPaid = bill.TotalAmount
+			bill.AmountDue = 0
+			state.bills[billID] = bill
+			state.payments[billID][0].Status = string(enums.PaymentStatusSuccess)
+		},
+	}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	response, err := service.GetBill(context.Background(), billingTestAuthContext(), billID)
+	if err != nil {
+		t.Fatalf("GetBill returned error: %v", err)
+	}
+	if coordinator.syncCalls != 1 {
+		t.Fatalf("expected one payment status sync hook call, got %d", coordinator.syncCalls)
+	}
+	if response.Bill.Status != string(enums.BillStatusPaid) {
+		t.Fatalf("expected synced bill status PAID, got %q", response.Bill.Status)
+	}
+	if response.Payments[0].Status != string(enums.PaymentStatusSuccess) {
+		t.Fatalf("expected synced payment SUCCESS, got %q", response.Payments[0].Status)
+	}
+}
+
+func TestGetBillCancelledBillDoesNotTriggerPaymentStatusSync(t *testing.T) {
+	state := newBillingServiceTestState()
+	billID := "99999999-9999-4999-8999-999999999999"
+	state.addStoredBill(billID, string(enums.BillStatusCancelled), string(PaymentModeOnline), 0, 10500)
+	gateway := "HDFC"
+	state.payments[billID] = []BillPaymentRecord{{
+		ID:            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Gateway:       &gateway,
+		PaymentMethod: string(PaymentModeOnline),
+		Amount:        10500,
+		Status:        string(enums.PaymentStatusPending),
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}}
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	response, err := service.GetBill(context.Background(), billingTestAuthContext(), billID)
+	if err != nil {
+		t.Fatalf("GetBill returned error: %v", err)
+	}
+	if coordinator.syncCalls != 0 {
+		t.Fatalf("cancelled bill must not trigger HDFC status sync, got %d calls", coordinator.syncCalls)
+	}
+	if response.Bill.Status != string(enums.BillStatusCancelled) {
+		t.Fatalf("expected CANCELLED bill state, got %q", response.Bill.Status)
+	}
+	if response.Payments[0].Status != string(enums.PaymentStatusPending) {
+		t.Fatalf("cancelled bill read should return stored payment state, got %q", response.Payments[0].Status)
+	}
+}
+
 type billingTestAuditRecorder struct {
 	calls             int
 	paymentEventCalls int
@@ -425,6 +514,8 @@ type billingTestOnlinePaymentCoordinator struct {
 	initiatedAfterCommit bool
 	ensureErr            error
 	initiateErr          error
+	syncCalls            int
+	syncFn               func()
 }
 
 func (c *billingTestOnlinePaymentCoordinator) EnsureStoreReadyForOnline(context.Context, string, string) error {
@@ -445,6 +536,20 @@ func (c *billingTestOnlinePaymentCoordinator) InitiateBillOnlinePayment(
 		c.initiatedAfterCommit = c.state.billInsertCount > 0 && c.state.paymentInsertCount > 0
 	}
 	return c.initiateErr
+}
+
+func (c *billingTestOnlinePaymentCoordinator) SyncPendingBillPaymentStatus(
+	context.Context,
+	string,
+	string,
+	string,
+	string,
+) error {
+	c.syncCalls++
+	if c.syncFn != nil {
+		c.syncFn()
+	}
+	return nil
 }
 
 func (r *billingTestAuditRecorder) RecordBillCreated(

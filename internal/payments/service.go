@@ -21,6 +21,10 @@ type hdfcCancelClient interface {
 	CancelSale(ctx context.Context, req hdfc.CancelSaleRequest) (hdfc.TransactionResponse, error)
 }
 
+type hdfcStatusClient interface {
+	GetTransactionStatus(ctx context.Context, req hdfc.TransactionStatusRequest) (hdfc.TransactionResponse, error)
+}
+
 type auditRecorder interface {
 	RecordPaymentEvent(
 		ctx context.Context,
@@ -260,6 +264,112 @@ func (s *Service) CancelBillOnlinePaymentAttempt(
 	return nil
 }
 
+func (s *Service) SyncPendingBillPaymentStatus(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	billID string,
+	performedByUserID string,
+) error {
+	payment, found, err := s.repo.FindPendingHDFCPaymentForBill(ctx, tenantID, storeID, billID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if strings.TrimSpace(payment.ProviderTxnID) == "" {
+		return apperrors.New(apperrors.CodeInternalError, "HDFC status sync requires provider transaction id")
+	}
+	if strings.TrimSpace(payment.TerminalTID) == "" {
+		return apperrors.New(apperrors.CodeInternalError, "HDFC status sync requires terminal id")
+	}
+	statusClient, ok := s.client.(hdfcStatusClient)
+	if !ok || statusClient == nil {
+		return apperrors.New(apperrors.CodeInternalError, "HDFC payment status client is not configured")
+	}
+
+	response, err := statusClient.GetTransactionStatus(ctx, hdfc.TransactionStatusRequest{
+		TID:       payment.TerminalTID,
+		BHTxnID:   payment.ProviderTxnID,
+		SaleTxnID: payment.ProviderRequestID,
+	})
+	if err != nil {
+		s.logger.Error(
+			"HDFC status sync failed",
+			"tenant_id", tenantID,
+			"store_id", storeID,
+			"bill_id", billID,
+			"payment_id", payment.ID,
+			"provider_request_id", payment.ProviderRequestID,
+			"provider_txn_id", payment.ProviderTxnID,
+			"error", err,
+		)
+		return err
+	}
+
+	normalizedStatus := mapHDFCStatusSyncStatus(response)
+	checkedAt := s.now()
+	var providerConfirmedAt *time.Time
+	var verifiedAt *time.Time
+	if isTerminalPaymentStatus(normalizedStatus) {
+		providerConfirmedAt = &checkedAt
+	}
+	if normalizedStatus == string(enums.PaymentStatusSuccess) {
+		verifiedAt = &checkedAt
+	}
+
+	result, err := s.repo.ApplyHDFCStatusSync(ctx, tenantID, storeID, StatusSyncUpdateInput{
+		PaymentID:             payment.ID,
+		BillID:                payment.BillID,
+		Status:                normalizedStatus,
+		ProviderRequestID:     nonEmpty(response.SaleTxnID, payment.ProviderRequestID),
+		ProviderTxnID:         nonEmpty(response.BHTxnID, payment.ProviderTxnID),
+		TerminalTID:           payment.TerminalTID,
+		ProviderStatusCode:    response.StatusCode,
+		ProviderStatusMessage: response.StatusMessage,
+		ProviderTxnStatus:     response.TxnStatus,
+		ProviderTxnMessage:    response.TxnMessage,
+		ActualCompletionMode:  hdfc.ActualCompletionMode(response),
+		StatusResponsePayload: response.RawPayload,
+		LastStatusCheckedAt:   checkedAt,
+		ProviderConfirmedAt:   providerConfirmedAt,
+		VerifiedAt:            verifiedAt,
+		UpdatedAt:             checkedAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.TransitionApplied {
+		s.recordPaymentStatusSyncAudit(
+			ctx,
+			tenantID,
+			storeID,
+			payment.ID,
+			performedByUserID,
+			result.OldPaymentStatus,
+			result.NewPaymentStatus,
+			response,
+		)
+	}
+
+	s.logger.Info(
+		"HDFC status sync completed",
+		"tenant_id", tenantID,
+		"store_id", storeID,
+		"bill_id", billID,
+		"payment_id", payment.ID,
+		"provider_request_id", nonEmpty(response.SaleTxnID, payment.ProviderRequestID),
+		"provider_txn_id", nonEmpty(response.BHTxnID, payment.ProviderTxnID),
+		"provider_txn_status", response.TxnStatus,
+		"payment_status", result.NewPaymentStatus,
+		"transition_applied", result.TransitionApplied,
+	)
+
+	return nil
+}
+
 func (s *Service) recordPaymentAudit(
 	ctx context.Context,
 	tenantID string,
@@ -301,6 +411,56 @@ func (s *Service) recordPaymentAudit(
 		},
 	); err != nil {
 		s.logger.Error("payment audit write failed", "payment_id", paymentID, "error", err)
+	}
+}
+
+func (s *Service) recordPaymentStatusSyncAudit(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	paymentID string,
+	performedByUserID string,
+	oldStatus string,
+	newStatus string,
+	response hdfc.TransactionResponse,
+) {
+	if s.audit == nil {
+		return
+	}
+
+	action := ""
+	switch enums.PaymentStatus(newStatus) {
+	case enums.PaymentStatusSuccess:
+		action = "PAYMENT_SUCCESS"
+	case enums.PaymentStatusFailed:
+		action = "PAYMENT_FAILED"
+	case enums.PaymentStatusCancelled:
+		action = "PAYMENT_CANCELLED"
+	default:
+		return
+	}
+
+	if err := s.audit.RecordPaymentEvent(
+		ctx,
+		tenantID,
+		storeID,
+		paymentID,
+		performedByUserID,
+		action,
+		map[string]any{
+			"gateway":                 GatewayHDFC,
+			"old_status":              oldStatus,
+			"new_status":              newStatus,
+			"provider_request_id":     response.SaleTxnID,
+			"provider_txn_id":         response.BHTxnID,
+			"provider_status_code":    response.StatusCode,
+			"provider_status_message": response.StatusMessage,
+			"provider_txn_status":     response.TxnStatus,
+			"provider_txn_message":    response.TxnMessage,
+			"actual_completion_mode":  hdfc.ActualCompletionMode(response),
+		},
+	); err != nil {
+		s.logger.Error("payment status sync audit write failed", "payment_id", paymentID, "error", err)
 	}
 }
 
@@ -371,4 +531,13 @@ func nonEmpty(primary string, fallback string) string {
 		return primary
 	}
 	return fallback
+}
+
+func isTerminalPaymentStatus(status string) bool {
+	switch enums.PaymentStatus(status) {
+	case enums.PaymentStatusSuccess, enums.PaymentStatusFailed, enums.PaymentStatusCancelled:
+		return true
+	default:
+		return false
+	}
 }

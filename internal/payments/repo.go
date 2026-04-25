@@ -163,6 +163,64 @@ LIMIT 1`
 	return payment, nil
 }
 
+func (r *Repo) FindPendingHDFCPaymentForBill(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	billID string,
+) (PaymentForStatusSync, bool, error) {
+	const query = `
+SELECT
+	p.id::text,
+	p.bill_id::text,
+	b.tenant_id::text,
+	b.store_id::text,
+	b.bill_number,
+	b.payment_mode_summary,
+	p.amount,
+	p.status,
+	COALESCE(p.gateway, ''),
+	COALESCE(p.provider_request_id, ''),
+	COALESCE(p.provider_txn_id, ''),
+	COALESCE(p.terminal_tid, '')
+FROM payments p
+INNER JOIN bills b
+	ON b.id = p.bill_id
+WHERE p.bill_id = $1
+  AND b.tenant_id = $2
+  AND b.store_id = $3
+  AND p.payment_method = 'ONLINE'
+  AND p.gateway = 'HDFC'
+  AND p.status IN ('INITIATED', 'PENDING')
+  AND b.status <> 'CANCELLED'
+ORDER BY p.created_at DESC, p.id DESC
+LIMIT 1`
+
+	var payment PaymentForStatusSync
+	err := r.db.QueryRowContext(ctx, query, billID, tenantID, storeID).Scan(
+		&payment.ID,
+		&payment.BillID,
+		&payment.TenantID,
+		&payment.StoreID,
+		&payment.BillNumber,
+		&payment.PaymentMode,
+		&payment.Amount,
+		&payment.Status,
+		&payment.Gateway,
+		&payment.ProviderRequestID,
+		&payment.ProviderTxnID,
+		&payment.TerminalTID,
+	)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return PaymentForStatusSync{}, false, nil
+		}
+		return PaymentForStatusSync{}, false, internalError("Failed to load pending HDFC payment", err)
+	}
+
+	return payment, true, nil
+}
+
 func (r *Repo) ClaimSaleRequest(
 	ctx context.Context,
 	paymentID string,
@@ -302,6 +360,57 @@ func (r *Repo) UpdatePaymentAttemptCancellation(ctx context.Context, tenantID st
 	})
 }
 
+func (r *Repo) ApplyHDFCStatusSync(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	input StatusSyncUpdateInput,
+) (StatusSyncApplyResult, error) {
+	var result StatusSyncApplyResult
+	err := platformdb.WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		currentStatus, billStatus, err := r.lockPaymentAndBillForStatusSync(
+			ctx,
+			tx,
+			tenantID,
+			storeID,
+			input.PaymentID,
+			input.BillID,
+		)
+		if err != nil {
+			return err
+		}
+
+		result = StatusSyncApplyResult{
+			PaymentID:        input.PaymentID,
+			OldPaymentStatus: currentStatus,
+			NewPaymentStatus: currentStatus,
+			BillStatus:       billStatus,
+		}
+		if billStatus == string(enums.BillStatusCancelled) {
+			return nil
+		}
+		if isTerminalPaymentStatus(currentStatus) {
+			return nil
+		}
+
+		if err := r.updatePaymentAfterStatusSync(ctx, tx, tenantID, storeID, input); err != nil {
+			return err
+		}
+		if isTerminalPaymentStatus(input.Status) {
+			if err := r.recomputeBillPaymentState(ctx, tx, input.BillID, input.UpdatedAt); err != nil {
+				return err
+			}
+			result.TransitionApplied = currentStatus != input.Status
+		}
+		result.NewPaymentStatus = input.Status
+		return nil
+	})
+	if err != nil {
+		return StatusSyncApplyResult{}, err
+	}
+	return result, nil
+}
+
 func (r *Repo) lockPaymentAttemptForCancellation(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -331,6 +440,39 @@ FOR UPDATE OF p, b`
 		return "", internalError("Failed to lock online payment attempt", err)
 	}
 	return status, nil
+}
+
+func (r *Repo) lockPaymentAndBillForStatusSync(
+	ctx context.Context,
+	tx *sql.Tx,
+	tenantID string,
+	storeID string,
+	paymentID string,
+	billID string,
+) (string, string, error) {
+	const query = `
+SELECT p.status, b.status
+FROM payments p
+INNER JOIN bills b
+	ON b.id = p.bill_id
+WHERE p.id = $1
+  AND p.bill_id = $2
+  AND b.tenant_id = $3
+  AND b.store_id = $4
+  AND p.payment_method = 'ONLINE'
+  AND p.gateway = 'HDFC'
+FOR UPDATE OF p, b`
+
+	var paymentStatus string
+	var billStatus string
+	err := tx.QueryRowContext(ctx, query, paymentID, billID, tenantID, storeID).Scan(&paymentStatus, &billStatus)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return "", "", apperrors.New(apperrors.CodeNotFound, "HDFC payment attempt not found")
+		}
+		return "", "", internalError("Failed to lock HDFC payment attempt", err)
+	}
+	return paymentStatus, billStatus, nil
 }
 
 func (r *Repo) updatePaymentAttemptCancellation(
@@ -392,6 +534,74 @@ WHERE payments.id = $1
 	return nil
 }
 
+func (r *Repo) updatePaymentAfterStatusSync(
+	ctx context.Context,
+	tx *sql.Tx,
+	tenantID string,
+	storeID string,
+	input StatusSyncUpdateInput,
+) error {
+	statusResponsePayload := input.StatusResponsePayload
+	if len(statusResponsePayload) == 0 {
+		statusResponsePayload = []byte("{}")
+	}
+
+	const query = `
+UPDATE payments
+SET status = $2,
+	provider_request_id = COALESCE(NULLIF($3, ''), provider_request_id),
+	provider_txn_id = COALESCE(NULLIF($4, ''), provider_txn_id),
+	terminal_tid = COALESCE(NULLIF($5, ''), terminal_tid),
+	provider_status_code = NULLIF($6, ''),
+	provider_status_message = NULLIF($7, ''),
+	provider_txn_status = NULLIF($8, ''),
+	provider_txn_message = NULLIF($9, ''),
+	actual_completion_mode = COALESCE(NULLIF($10, ''), actual_completion_mode),
+	status_details_payload = $11::jsonb,
+	last_status_checked_at = $12,
+	provider_confirmed_at = COALESCE(provider_confirmed_at, $13),
+	verified_at = COALESCE(verified_at, $14),
+	updated_at = $15
+FROM bills b
+WHERE payments.id = $1
+  AND payments.bill_id = $16
+  AND b.id = payments.bill_id
+  AND b.tenant_id = $17
+  AND b.store_id = $18
+  AND payments.payment_method = 'ONLINE'
+  AND payments.gateway = 'HDFC'`
+
+	result, err := tx.ExecContext(
+		ctx,
+		query,
+		input.PaymentID,
+		input.Status,
+		input.ProviderRequestID,
+		input.ProviderTxnID,
+		input.TerminalTID,
+		input.ProviderStatusCode,
+		input.ProviderStatusMessage,
+		input.ProviderTxnStatus,
+		input.ProviderTxnMessage,
+		input.ActualCompletionMode,
+		string(statusResponsePayload),
+		input.LastStatusCheckedAt,
+		input.ProviderConfirmedAt,
+		input.VerifiedAt,
+		input.UpdatedAt,
+		input.BillID,
+		tenantID,
+		storeID,
+	)
+	if err != nil {
+		return internalError("Failed to update HDFC status result", err)
+	}
+	if err := requireExactlyOneRow(result, "HDFC status result update"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *Repo) recomputeBillPaymentState(ctx context.Context, runner queryer, billID string, updatedAt time.Time) error {
 	const query = `
 WITH payment_totals AS (
@@ -409,6 +619,7 @@ UPDATE bills b
 SET amount_paid = LEAST(payment_totals.paid_amount, b.total_amount),
 	amount_due = GREATEST(b.total_amount - payment_totals.paid_amount, 0),
 	status = CASE
+		WHEN b.status = 'CANCELLED' THEN b.status
 		WHEN payment_totals.paid_amount >= b.total_amount THEN 'PAID'
 		WHEN b.payment_mode_summary = 'ONLINE' AND payment_totals.unresolved_count = 0 THEN 'PAYMENT_FAILED'
 		WHEN b.payment_mode_summary = 'ONLINE' THEN 'PAYMENT_PENDING'
@@ -416,6 +627,7 @@ SET amount_paid = LEAST(payment_totals.paid_amount, b.total_amount),
 		ELSE b.status
 	END,
 	paid_at = CASE
+		WHEN b.status = 'CANCELLED' THEN b.paid_at
 		WHEN payment_totals.paid_amount >= b.total_amount THEN COALESCE(b.paid_at, $2)
 		ELSE b.paid_at
 	END
