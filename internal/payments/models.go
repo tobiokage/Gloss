@@ -28,6 +28,21 @@ type PaymentForSale struct {
 	ProviderSaleRequestedAt *time.Time
 }
 
+type PaymentAttemptForCancel struct {
+	ID                string
+	BillID            string
+	TenantID          string
+	StoreID           string
+	BillNumber        string
+	PaymentMode       string
+	Amount            int64
+	Status            string
+	Gateway           string
+	ProviderRequestID string
+	ProviderTxnID     string
+	TerminalTID       string
+}
+
 type SaleRequestClaim struct {
 	ProviderRequestID string
 	TerminalTID       string
@@ -48,5 +63,20 @@ type SaleUpdateInput struct {
 	ResponsePayload       []byte
 	ConfirmedAt           *time.Time
 	VerifiedAt            *time.Time
+	UpdatedAt             time.Time
+}
+
+type CancelAttemptUpdateInput struct {
+	PaymentID             string
+	BillID                string
+	Status                string
+	ProviderRequestID     string
+	ProviderTxnID         string
+	TerminalTID           string
+	ProviderStatusCode    string
+	ProviderStatusMessage string
+	ProviderTxnStatus     string
+	ProviderTxnMessage    string
+	CancelResponsePayload []byte
 	UpdatedAt             time.Time
 }

@@ -178,17 +178,96 @@ func TestUpdatePaymentAfterSaleRequiresOneAffectedRow(t *testing.T) {
 	}
 }
 
+func TestCancelBillOnlinePaymentAttemptNonConfirmedResponseDoesNotMutateState(t *testing.T) {
+	state := newPaymentsServiceTestState()
+	state.paymentStatus = string(enums.PaymentStatusPending)
+	state.providerRequestID = "SALE-1"
+	state.providerTxnID = "BH-1"
+	state.terminalTID = state.terminalTIDConfig
+	db := openPaymentsServiceTestDB(t, state)
+	client := &paymentsTestHDFCClient{cancelResponse: hdfc.TransactionResponse{
+		StatusCode:    "00",
+		StatusMessage: "Accepted",
+		SaleTxnID:     "SALE-1",
+		TxnStatus:     hdfc.TxnStatusInProgress,
+		TxnMessage:    "Cancel in progress",
+		BHTxnID:       "BH-1",
+		RawPayload:    []byte(`{"txnStatus":"InProgress"}`),
+	}}
+	service := NewService(NewRepo(db), client, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	err := service.CancelBillOnlinePaymentAttempt(context.Background(), state.tenantID, state.storeID, state.billID, state.paymentID, state.userID)
+	if err == nil {
+		t.Fatal("expected non-confirmed HDFC cancellation to fail")
+	}
+	if client.cancelCallCount != 1 {
+		t.Fatalf("expected one HDFC cancel call, got %d", client.cancelCallCount)
+	}
+	if state.cancelUpdateCount != 0 {
+		t.Fatalf("non-confirmed cancellation must not update payment row, got %d updates", state.cancelUpdateCount)
+	}
+	if state.paymentStatus != string(enums.PaymentStatusPending) {
+		t.Fatalf("payment status changed on non-confirmed cancellation: %q", state.paymentStatus)
+	}
+	if state.recomputeCount != 0 {
+		t.Fatalf("non-confirmed cancellation must not recompute bill state, got %d recomputes", state.recomputeCount)
+	}
+}
+
+func TestUpdatePaymentAttemptCancellationRequiresTenantStoreScope(t *testing.T) {
+	state := newPaymentsServiceTestState()
+	state.paymentStatus = string(enums.PaymentStatusPending)
+	state.providerRequestID = "SALE-1"
+	state.providerTxnID = "BH-1"
+	state.terminalTID = state.terminalTIDConfig
+	db := openPaymentsServiceTestDB(t, state)
+
+	err := NewRepo(db).UpdatePaymentAttemptCancellation(context.Background(), "wrong-tenant", state.storeID, CancelAttemptUpdateInput{
+		PaymentID:             state.paymentID,
+		BillID:                state.billID,
+		Status:                string(enums.PaymentStatusCancelled),
+		ProviderRequestID:     state.providerRequestID,
+		ProviderTxnID:         state.providerTxnID,
+		TerminalTID:           state.terminalTID,
+		ProviderStatusCode:    "00",
+		ProviderStatusMessage: "Cancelled",
+		ProviderTxnStatus:     hdfc.TxnStatusCanceled,
+		ProviderTxnMessage:    "Cancelled",
+		CancelResponsePayload: []byte(`{"txnStatus":"Canceled"}`),
+		UpdatedAt:             time.Now().UTC(),
+	})
+	if err == nil {
+		t.Fatal("expected wrong tenant scope to fail")
+	}
+	if state.cancelUpdateCount != 0 {
+		t.Fatalf("wrong tenant scope must not update cancellation row, got %d updates", state.cancelUpdateCount)
+	}
+	if state.paymentStatus != string(enums.PaymentStatusPending) {
+		t.Fatalf("payment status changed despite wrong tenant scope: %q", state.paymentStatus)
+	}
+}
+
 type paymentsTestHDFCClient struct {
-	response  hdfc.TransactionResponse
-	err       error
-	callCount int
-	requests  []hdfc.CreateSaleRequest
+	response        hdfc.TransactionResponse
+	cancelResponse  hdfc.TransactionResponse
+	err             error
+	cancelErr       error
+	callCount       int
+	cancelCallCount int
+	requests        []hdfc.CreateSaleRequest
+	cancelRequests  []hdfc.CancelSaleRequest
 }
 
 func (c *paymentsTestHDFCClient) CreateSale(_ context.Context, req hdfc.CreateSaleRequest) (hdfc.TransactionResponse, error) {
 	c.callCount++
 	c.requests = append(c.requests, req)
 	return c.response, c.err
+}
+
+func (c *paymentsTestHDFCClient) CancelSale(_ context.Context, req hdfc.CancelSaleRequest) (hdfc.TransactionResponse, error) {
+	c.cancelCallCount++
+	c.cancelRequests = append(c.cancelRequests, req)
+	return c.cancelResponse, c.cancelErr
 }
 
 type paymentsServiceTestState struct {
@@ -215,6 +294,7 @@ type paymentsServiceTestState struct {
 	providerConfirmedAt       *time.Time
 	verifiedAt                *time.Time
 	recomputeCount            int
+	cancelUpdateCount         int
 	paymentUpdateRowsAffected int64
 	recomputeRowsAffected     int64
 }
@@ -332,6 +412,23 @@ func (s *paymentsServiceTestState) exec(query string, args []any) (driver.Result
 		s.providerStatusCode = "SALE_REQUEST_UNRESOLVED"
 		s.providerStatusMessage = "HDFC sale request outcome is unresolved"
 		return driver.RowsAffected(s.paymentUpdateRowsAffected), nil
+	case strings.HasPrefix(normalized, "update payments set status ="):
+		if paymentsServiceTestString(args[0]) != s.paymentID ||
+			paymentsServiceTestString(args[11]) != s.billID ||
+			paymentsServiceTestString(args[12]) != s.tenantID ||
+			paymentsServiceTestString(args[13]) != s.storeID {
+			return driver.RowsAffected(0), nil
+		}
+		s.paymentStatus = paymentsServiceTestString(args[1])
+		s.providerRequestID = paymentsServiceTestString(args[2])
+		s.providerTxnID = paymentsServiceTestString(args[3])
+		s.terminalTID = paymentsServiceTestString(args[4])
+		s.providerStatusCode = paymentsServiceTestString(args[5])
+		s.providerStatusMessage = paymentsServiceTestString(args[6])
+		s.providerTxnStatus = paymentsServiceTestString(args[7])
+		s.providerTxnMessage = paymentsServiceTestString(args[8])
+		s.cancelUpdateCount++
+		return driver.RowsAffected(s.paymentUpdateRowsAffected), nil
 	case strings.HasPrefix(normalized, "update payments set gateway = 'hdfc', status ="):
 		s.paymentStatus = paymentsServiceTestString(args[1])
 		s.providerRequestID = paymentsServiceTestString(args[2])
@@ -360,6 +457,38 @@ func (s *paymentsServiceTestState) query(query string, args []any) (driver.Rows,
 	defer s.mu.Unlock()
 
 	switch normalized := paymentsServiceTestNormalizeQuery(query); {
+	case strings.HasPrefix(normalized, "select p.status from payments p"):
+		if paymentsServiceTestString(args[0]) != s.paymentID ||
+			paymentsServiceTestString(args[1]) != s.billID ||
+			paymentsServiceTestString(args[2]) != s.tenantID ||
+			paymentsServiceTestString(args[3]) != s.storeID {
+			return &paymentsServiceTestRows{columns: []string{"status"}}, nil
+		}
+		return &paymentsServiceTestRows{
+			columns: []string{"status"},
+			values:  [][]driver.Value{{s.paymentStatus}},
+		}, nil
+	case strings.Contains(normalized, "coalesce(p.gateway"):
+		return &paymentsServiceTestRows{
+			columns: []string{
+				"id", "bill_id", "tenant_id", "store_id", "bill_number", "payment_mode_summary",
+				"amount", "status", "gateway", "provider_request_id", "provider_txn_id", "terminal_tid",
+			},
+			values: [][]driver.Value{{
+				s.paymentID,
+				s.billID,
+				s.tenantID,
+				s.storeID,
+				s.billNumber,
+				s.paymentMode,
+				s.paymentAmount,
+				s.paymentStatus,
+				GatewayHDFC,
+				s.providerRequestID,
+				s.providerTxnID,
+				s.terminalTID,
+			}},
+		}, nil
 	case strings.Contains(normalized, "from payments p"):
 		return &paymentsServiceTestRows{
 			columns: []string{

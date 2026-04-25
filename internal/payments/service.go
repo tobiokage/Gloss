@@ -17,6 +17,10 @@ type hdfcSaleClient interface {
 	CreateSale(ctx context.Context, req hdfc.CreateSaleRequest) (hdfc.TransactionResponse, error)
 }
 
+type hdfcCancelClient interface {
+	CancelSale(ctx context.Context, req hdfc.CancelSaleRequest) (hdfc.TransactionResponse, error)
+}
+
 type auditRecorder interface {
 	RecordPaymentEvent(
 		ctx context.Context,
@@ -180,6 +184,82 @@ func (s *Service) InitiateBillOnlinePayment(
 	return nil
 }
 
+func (s *Service) CancelBillOnlinePaymentAttempt(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	billID string,
+	paymentID string,
+	performedByUserID string,
+) error {
+	cancelClient, ok := s.client.(hdfcCancelClient)
+	if !ok || cancelClient == nil {
+		return apperrors.New(apperrors.CodeInternalError, "HDFC payment client is not configured")
+	}
+
+	payment, err := s.repo.GetPaymentAttemptForCancel(ctx, tenantID, storeID, billID, paymentID)
+	if err != nil {
+		return err
+	}
+	if err := validatePaymentAttemptCancellable(payment); err != nil {
+		return err
+	}
+
+	response, err := cancelClient.CancelSale(ctx, hdfc.CancelSaleRequest{
+		TID:       payment.TerminalTID,
+		BHTxnID:   payment.ProviderTxnID,
+		SaleTxnID: payment.ProviderRequestID,
+	})
+	if err != nil {
+		s.logger.Error(
+			"HDFC cancel sale failed",
+			"tenant_id", tenantID,
+			"store_id", storeID,
+			"bill_id", billID,
+			"payment_id", paymentID,
+			"provider_request_id", payment.ProviderRequestID,
+			"provider_txn_id", payment.ProviderTxnID,
+			"error", err,
+		)
+		return err
+	}
+
+	confirmedCancelled := strings.TrimSpace(response.TxnStatus) == hdfc.TxnStatusCanceled
+	if !confirmedCancelled {
+		return apperrors.New(apperrors.CodeInvalidRequest, "HDFC did not confirm payment-attempt cancellation")
+	}
+
+	updatedAt := s.now()
+	if err := s.repo.UpdatePaymentAttemptCancellation(ctx, tenantID, storeID, CancelAttemptUpdateInput{
+		PaymentID:             payment.ID,
+		BillID:                payment.BillID,
+		Status:                string(enums.PaymentStatusCancelled),
+		ProviderRequestID:     nonEmpty(response.SaleTxnID, payment.ProviderRequestID),
+		ProviderTxnID:         nonEmpty(response.BHTxnID, payment.ProviderTxnID),
+		TerminalTID:           payment.TerminalTID,
+		ProviderStatusCode:    response.StatusCode,
+		ProviderStatusMessage: response.StatusMessage,
+		ProviderTxnStatus:     response.TxnStatus,
+		ProviderTxnMessage:    response.TxnMessage,
+		CancelResponsePayload: response.RawPayload,
+		UpdatedAt:             updatedAt,
+	}); err != nil {
+		return err
+	}
+
+	s.recordPaymentAttemptCancellationAudit(ctx, tenantID, storeID, payment.ID, performedByUserID, response)
+	s.logger.Info(
+		"HDFC payment attempt cancelled",
+		"tenant_id", tenantID,
+		"store_id", storeID,
+		"bill_id", billID,
+		"payment_id", payment.ID,
+		"provider_request_id", nonEmpty(response.SaleTxnID, payment.ProviderRequestID),
+		"provider_txn_id", nonEmpty(response.BHTxnID, payment.ProviderTxnID),
+	)
+	return nil
+}
+
 func (s *Service) recordPaymentAudit(
 	ctx context.Context,
 	tenantID string,
@@ -222,6 +302,55 @@ func (s *Service) recordPaymentAudit(
 	); err != nil {
 		s.logger.Error("payment audit write failed", "payment_id", paymentID, "error", err)
 	}
+}
+
+func (s *Service) recordPaymentAttemptCancellationAudit(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	paymentID string,
+	performedByUserID string,
+	response hdfc.TransactionResponse,
+) {
+	if s.audit == nil {
+		return
+	}
+
+	if err := s.audit.RecordPaymentEvent(
+		ctx,
+		tenantID,
+		storeID,
+		paymentID,
+		performedByUserID,
+		"PAYMENT_ATTEMPT_CANCELLED",
+		map[string]any{
+			"gateway":                 GatewayHDFC,
+			"provider_request_id":     response.SaleTxnID,
+			"provider_txn_id":         response.BHTxnID,
+			"provider_status_code":    response.StatusCode,
+			"provider_status_message": response.StatusMessage,
+			"provider_txn_status":     response.TxnStatus,
+			"provider_txn_message":    response.TxnMessage,
+		},
+	); err != nil {
+		s.logger.Error("payment-attempt cancellation audit write failed", "payment_id", paymentID, "error", err)
+	}
+}
+
+func validatePaymentAttemptCancellable(payment PaymentAttemptForCancel) error {
+	if strings.TrimSpace(payment.Gateway) != GatewayHDFC {
+		return apperrors.New(apperrors.CodeInvalidRequest, "Payment attempt is not HDFC-backed")
+	}
+	if payment.Status != string(enums.PaymentStatusInitiated) && payment.Status != string(enums.PaymentStatusPending) {
+		return apperrors.New(apperrors.CodeInvalidRequest, "Payment attempt is not provider-cancellable")
+	}
+	if strings.TrimSpace(payment.ProviderTxnID) == "" {
+		return apperrors.New(apperrors.CodeInvalidRequest, "Payment attempt is missing provider transaction id")
+	}
+	if strings.TrimSpace(payment.TerminalTID) == "" {
+		return apperrors.New(apperrors.CodeInvalidRequest, "Payment attempt is missing terminal id")
+	}
+	return validateTerminalTID(payment.TerminalTID)
 }
 
 func newSaleTxnID(paymentID string) string {

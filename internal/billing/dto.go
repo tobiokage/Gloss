@@ -12,6 +12,15 @@ type CreateBillRequest struct {
 	IdempotencyKey string                       `json:"idempotency_key"`
 }
 
+type CancelBillRequest struct {
+	Reason string `json:"reason"`
+}
+
+type RetryOnlinePaymentRequest struct {
+	ClientRetryRef string `json:"client_retry_ref,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
 type CreateBillItemRequest struct {
 	CatalogueItemID string `json:"catalogue_item_id"`
 	Quantity        int64  `json:"quantity"`

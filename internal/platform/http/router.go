@@ -13,6 +13,10 @@ func NewRouter(
 	storeManagerOnlyMiddleware func(next nethttp.Handler) nethttp.Handler,
 	storeBootstrapHandler nethttp.HandlerFunc,
 	createBillHandler nethttp.HandlerFunc,
+	getBillHandler nethttp.HandlerFunc,
+	cancelBillHandler nethttp.HandlerFunc,
+	retryOnlinePaymentHandler nethttp.HandlerFunc,
+	cancelPaymentAttemptHandler nethttp.HandlerFunc,
 	adminCatalogueListHandler nethttp.HandlerFunc,
 	adminCatalogueCreateHandler nethttp.HandlerFunc,
 	adminCatalogueUpdateHandler nethttp.HandlerFunc,
@@ -31,6 +35,10 @@ func NewRouter(
 	router.Post("/auth/login", authLoginHandler)
 	router.With(authMiddleware).Get("/store/bootstrap", storeBootstrapHandler)
 	router.With(authMiddleware, storeManagerOnlyMiddleware).Post("/bills", createBillHandler)
+	router.With(authMiddleware, storeManagerOnlyMiddleware).Get("/bills/{bill_id}", getBillHandler)
+	router.With(authMiddleware, storeManagerOnlyMiddleware).Post("/bills/{bill_id}/cancel", cancelBillHandler)
+	router.With(authMiddleware, storeManagerOnlyMiddleware).Post("/bills/{bill_id}/payments/retry-online", retryOnlinePaymentHandler)
+	router.With(authMiddleware, storeManagerOnlyMiddleware).Post("/bills/{bill_id}/payments/{payment_id}/cancel-attempt", cancelPaymentAttemptHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/catalogue", adminCatalogueListHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/catalogue", adminCatalogueCreateHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Put("/admin/catalogue/{item_id}", adminCatalogueUpdateHandler)

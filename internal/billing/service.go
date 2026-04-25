@@ -27,9 +27,43 @@ type auditRecorder interface {
 	) error
 }
 
+type billCancelledAuditRecorder interface {
+	RecordBillCancelled(
+		ctx context.Context,
+		tenantID string,
+		storeID string,
+		billID string,
+		performedByUserID string,
+		metadata map[string]any,
+	) error
+}
+
+type paymentEventAuditRecorder interface {
+	RecordPaymentEvent(
+		ctx context.Context,
+		tenantID string,
+		storeID string,
+		paymentID string,
+		performedByUserID string,
+		action string,
+		metadata map[string]any,
+	) error
+}
+
 type onlinePaymentCoordinator interface {
 	EnsureStoreReadyForOnline(ctx context.Context, tenantID string, storeID string) error
 	InitiateBillOnlinePayment(
+		ctx context.Context,
+		tenantID string,
+		storeID string,
+		billID string,
+		paymentID string,
+		performedByUserID string,
+	) error
+}
+
+type onlinePaymentAttemptCanceller interface {
+	CancelBillOnlinePaymentAttempt(
 		ctx context.Context,
 		tenantID string,
 		storeID string,
@@ -426,6 +460,246 @@ func (s *Service) CreateBill(ctx context.Context, authCtx auth.AuthContext, req 
 	return MapBillGraphToCreateBillResponse(graph), nil
 }
 
+func (s *Service) GetBill(ctx context.Context, authCtx auth.AuthContext, billID string) (CreateBillResponse, error) {
+	scope, billID, err := validateStoreBillScope(authCtx, billID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	graph, err := s.repo.GetBillGraph(ctx, billID, scope.TenantID, scope.StoreID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	return MapBillGraphToCreateBillResponse(graph), nil
+}
+
+func (s *Service) CancelBill(
+	ctx context.Context,
+	authCtx auth.AuthContext,
+	billID string,
+	req CancelBillRequest,
+) (CreateBillResponse, error) {
+	scope, billID, err := validateStoreBillScope(authCtx, billID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		return CreateBillResponse{}, apperrors.New(apperrors.CodeInvalidRequest, "reason is required")
+	}
+
+	cancelledAt := time.Now().UTC()
+	var cancelledBill BillRecord
+	err = platformdb.WithTx(ctx, s.db, func(tx *sql.Tx) error {
+		bill, err := s.repo.LockBillForStore(ctx, tx, billID, scope.TenantID, scope.StoreID)
+		if err != nil {
+			return err
+		}
+		if bill.Status == string(enums.BillStatusCancelled) {
+			return apperrors.New(apperrors.CodeInvalidRequest, "Bill is already cancelled")
+		}
+		hasActivePayment, err := s.repo.HasActivePendingOnlinePayment(ctx, tx, billID)
+		if err != nil {
+			return err
+		}
+		if hasActivePayment {
+			return apperrors.New(apperrors.CodeInvalidRequest, "Bill has an active pending online payment attempt")
+		}
+		if err := s.repo.CancelBill(ctx, tx, billID, scope.UserID, reason, cancelledAt); err != nil {
+			return err
+		}
+		bill.Status = string(enums.BillStatusCancelled)
+		cancelledBill = bill
+		return nil
+	})
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	if recorder, ok := s.auditRecorder.(billCancelledAuditRecorder); ok {
+		if err := recorder.RecordBillCancelled(
+			ctx,
+			scope.TenantID,
+			scope.StoreID,
+			billID,
+			scope.UserID,
+			map[string]any{
+				"bill_number":  cancelledBill.BillNumber,
+				"reason":       reason,
+				"cancelled_at": cancelledAt,
+			},
+		); err != nil {
+			s.logger.Error("bill cancelled but audit write failed", "bill_id", billID, "error", err)
+		}
+	}
+
+	graph, err := s.repo.GetBillGraph(ctx, billID, scope.TenantID, scope.StoreID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	return MapBillGraphToCreateBillResponse(graph), nil
+}
+
+func (s *Service) RetryOnlinePayment(
+	ctx context.Context,
+	authCtx auth.AuthContext,
+	billID string,
+	req RetryOnlinePaymentRequest,
+) (CreateBillResponse, error) {
+	scope, billID, err := validateStoreBillScope(authCtx, billID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	if s.payments == nil {
+		return CreateBillResponse{}, apperrors.New(apperrors.CodeInternalError, "HDFC payment service is not configured")
+	}
+
+	idempotencyKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempotencyKey == "" {
+		return CreateBillResponse{}, apperrors.New(apperrors.CodeInvalidRequest, "idempotency_key is required")
+	}
+	clientRetryRef := strings.TrimSpace(req.ClientRetryRef)
+	requestHash, err := idempotency.CanonicalRequestHash(struct {
+		BillID         string `json:"bill_id"`
+		ClientRetryRef string `json:"client_retry_ref,omitempty"`
+	}{
+		BillID:         billID,
+		ClientRetryRef: clientRetryRef,
+	})
+	if err != nil {
+		return CreateBillResponse{}, apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to prepare retry online payment request",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+
+	var (
+		paymentID string
+		created   bool
+	)
+	now := time.Now().UTC()
+	err = platformdb.WithTx(ctx, s.db, func(tx *sql.Tx) error {
+		claim, err := s.idempotencyStore.ClaimCreateBill(ctx, tx, scope.TenantID, scope.StoreID, idempotencyKey, requestHash)
+		if err != nil {
+			return err
+		}
+		if claim.Completed {
+			return nil
+		}
+		if err := s.payments.EnsureStoreReadyForOnline(ctx, scope.TenantID, scope.StoreID); err != nil {
+			return err
+		}
+
+		bill, err := s.repo.LockBillForStore(ctx, tx, billID, scope.TenantID, scope.StoreID)
+		if err != nil {
+			return err
+		}
+		if bill.AmountDue <= 0 {
+			return apperrors.New(apperrors.CodeInvalidRequest, "Bill has no outstanding online amount due")
+		}
+		if !isBillEligibleForOnlineRetry(bill) {
+			return apperrors.New(apperrors.CodeInvalidRequest, "Bill is not eligible for online payment retry")
+		}
+		hasActivePayment, err := s.repo.HasActivePendingOnlinePayment(ctx, tx, billID)
+		if err != nil {
+			return err
+		}
+		if hasActivePayment {
+			return apperrors.New(apperrors.CodeInvalidRequest, "Bill already has an active pending online payment attempt")
+		}
+
+		paymentID, err = newServiceUUIDString()
+		if err != nil {
+			return paymentRowIDError("retry online", err)
+		}
+		gateway := "HDFC"
+		if err := s.repo.InsertPayment(ctx, tx, InsertPaymentInput{
+			ID:            paymentID,
+			BillID:        billID,
+			Gateway:       &gateway,
+			PaymentMethod: string(PaymentModeOnline),
+			Amount:        bill.AmountDue,
+			Status:        string(enums.PaymentStatusInitiated),
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}); err != nil {
+			return err
+		}
+		if err := s.repo.MarkBillOnlineRetryInitiated(ctx, tx, billID); err != nil {
+			return err
+		}
+		if err := s.idempotencyStore.CompleteCreateBill(ctx, tx, scope.TenantID, scope.StoreID, idempotencyKey, billID); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	if created {
+		if recorder, ok := s.auditRecorder.(paymentEventAuditRecorder); ok {
+			if err := recorder.RecordPaymentEvent(
+				ctx,
+				scope.TenantID,
+				scope.StoreID,
+				paymentID,
+				scope.UserID,
+				"PAYMENT_RETRY_INITIATED",
+				map[string]any{
+					"bill_id":          billID,
+					"idempotency_key":  idempotencyKey,
+					"client_retry_ref": clientRetryRef,
+				},
+			); err != nil {
+				s.logger.Error("payment retry audit write failed", "payment_id", paymentID, "error", err)
+			}
+		}
+		if err := s.payments.InitiateBillOnlinePayment(ctx, scope.TenantID, scope.StoreID, billID, paymentID, scope.UserID); err != nil {
+			return CreateBillResponse{}, err
+		}
+	}
+
+	graph, err := s.repo.GetBillGraph(ctx, billID, scope.TenantID, scope.StoreID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	return MapBillGraphToCreateBillResponse(graph), nil
+}
+
+func (s *Service) CancelPaymentAttempt(
+	ctx context.Context,
+	authCtx auth.AuthContext,
+	billID string,
+	paymentID string,
+) (CreateBillResponse, error) {
+	scope, billID, err := validateStoreBillScope(authCtx, billID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	paymentID, err = validateBillUUID("payment_id", paymentID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	canceller, ok := s.payments.(onlinePaymentAttemptCanceller)
+	if !ok || canceller == nil {
+		return CreateBillResponse{}, apperrors.New(apperrors.CodeInternalError, "HDFC payment cancellation is not configured")
+	}
+	if err := canceller.CancelBillOnlinePaymentAttempt(ctx, scope.TenantID, scope.StoreID, billID, paymentID, scope.UserID); err != nil {
+		return CreateBillResponse{}, err
+	}
+
+	graph, err := s.repo.GetBillGraph(ctx, billID, scope.TenantID, scope.StoreID)
+	if err != nil {
+		return CreateBillResponse{}, err
+	}
+	return MapBillGraphToCreateBillResponse(graph), nil
+}
+
 func validateCreateBillScope(authCtx auth.AuthContext) (auth.AuthContext, error) {
 	if err := auth.RequireRole(authCtx, enums.RoleStoreManager); err != nil {
 		return auth.AuthContext{}, err
@@ -439,6 +713,32 @@ func validateCreateBillScope(authCtx auth.AuthContext) (auth.AuthContext, error)
 	}
 
 	return authCtx, nil
+}
+
+func validateStoreBillScope(authCtx auth.AuthContext, rawBillID string) (auth.AuthContext, string, error) {
+	scope, err := validateCreateBillScope(authCtx)
+	if err != nil {
+		return auth.AuthContext{}, "", err
+	}
+	billID, err := validateBillUUID("bill_id", rawBillID)
+	if err != nil {
+		return auth.AuthContext{}, "", err
+	}
+	return scope, billID, nil
+}
+
+func isBillEligibleForOnlineRetry(bill BillRecord) bool {
+	if bill.PaymentModeSummary != string(PaymentModeOnline) && bill.PaymentModeSummary != string(PaymentModeSplit) {
+		return false
+	}
+	switch bill.Status {
+	case string(enums.BillStatusPaymentFailed),
+		string(enums.BillStatusPaymentPending),
+		string(enums.BillStatusPartiallyPaid):
+		return true
+	default:
+		return false
+	}
 }
 
 func collectCatalogueItemIDs(items []ValidatedCreateBillItem) []string {

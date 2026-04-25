@@ -298,3 +298,7 @@ func validateCreateBillUUID(fieldName string, rawValue string) (string, error) {
 
 	return normalizedValue, nil
 }
+
+func validateBillUUID(fieldName string, rawValue string) (string, error) {
+	return validateCreateBillUUID(fieldName, rawValue)
+}

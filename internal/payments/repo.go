@@ -8,6 +8,7 @@ import (
 	"time"
 
 	platformdb "gloss/internal/platform/db"
+	"gloss/internal/shared/enums"
 	apperrors "gloss/internal/shared/errors"
 )
 
@@ -101,6 +102,62 @@ LIMIT 1`
 
 	if providerSaleRequestedAt.Valid {
 		payment.ProviderSaleRequestedAt = &providerSaleRequestedAt.Time
+	}
+
+	return payment, nil
+}
+
+func (r *Repo) GetPaymentAttemptForCancel(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	billID string,
+	paymentID string,
+) (PaymentAttemptForCancel, error) {
+	const query = `
+SELECT
+	p.id::text,
+	p.bill_id::text,
+	b.tenant_id::text,
+	b.store_id::text,
+	b.bill_number,
+	b.payment_mode_summary,
+	p.amount,
+	p.status,
+	COALESCE(p.gateway, ''),
+	COALESCE(p.provider_request_id, ''),
+	COALESCE(p.provider_txn_id, ''),
+	COALESCE(p.terminal_tid, '')
+FROM payments p
+INNER JOIN bills b
+	ON b.id = p.bill_id
+WHERE p.id = $1
+  AND p.bill_id = $2
+  AND b.tenant_id = $3
+  AND b.store_id = $4
+  AND p.payment_method = 'ONLINE'
+LIMIT 1`
+
+	var payment PaymentAttemptForCancel
+	err := r.db.QueryRowContext(ctx, query, paymentID, billID, tenantID, storeID).Scan(
+		&payment.ID,
+		&payment.BillID,
+		&payment.TenantID,
+		&payment.StoreID,
+		&payment.BillNumber,
+		&payment.PaymentMode,
+		&payment.Amount,
+		&payment.Status,
+		&payment.Gateway,
+		&payment.ProviderRequestID,
+		&payment.ProviderTxnID,
+		&payment.TerminalTID,
+	)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return PaymentAttemptForCancel{}, apperrors.New(apperrors.CodeNotFound, "Online payment attempt not found")
+		}
+		return PaymentAttemptForCancel{}, internalError("Failed to load online payment attempt", err)
 	}
 
 	return payment, nil
@@ -227,6 +284,112 @@ WHERE id = $1`
 
 func (r *Repo) RecomputeBillPaymentState(ctx context.Context, billID string, updatedAt time.Time) error {
 	return r.recomputeBillPaymentState(ctx, r.db, billID, updatedAt)
+}
+
+func (r *Repo) UpdatePaymentAttemptCancellation(ctx context.Context, tenantID string, storeID string, input CancelAttemptUpdateInput) error {
+	return platformdb.WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		currentStatus, err := r.lockPaymentAttemptForCancellation(ctx, tx, tenantID, storeID, input.PaymentID, input.BillID)
+		if err != nil {
+			return err
+		}
+		if currentStatus != string(enums.PaymentStatusInitiated) && currentStatus != string(enums.PaymentStatusPending) {
+			return apperrors.New(apperrors.CodeInvalidRequest, "Payment attempt is not provider-cancellable")
+		}
+		if err := r.updatePaymentAttemptCancellation(ctx, tx, tenantID, storeID, input); err != nil {
+			return err
+		}
+		return r.recomputeBillPaymentState(ctx, tx, input.BillID, input.UpdatedAt)
+	})
+}
+
+func (r *Repo) lockPaymentAttemptForCancellation(
+	ctx context.Context,
+	tx *sql.Tx,
+	tenantID string,
+	storeID string,
+	paymentID string,
+	billID string,
+) (string, error) {
+	const query = `
+SELECT p.status
+FROM payments p
+INNER JOIN bills b
+	ON b.id = p.bill_id
+WHERE p.id = $1
+  AND p.bill_id = $2
+  AND b.tenant_id = $3
+  AND b.store_id = $4
+  AND p.payment_method = 'ONLINE'
+FOR UPDATE OF p, b`
+
+	var status string
+	err := tx.QueryRowContext(ctx, query, paymentID, billID, tenantID, storeID).Scan(&status)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return "", apperrors.New(apperrors.CodeNotFound, "Online payment attempt not found")
+		}
+		return "", internalError("Failed to lock online payment attempt", err)
+	}
+	return status, nil
+}
+
+func (r *Repo) updatePaymentAttemptCancellation(
+	ctx context.Context,
+	tx *sql.Tx,
+	tenantID string,
+	storeID string,
+	input CancelAttemptUpdateInput,
+) error {
+	cancelResponsePayload := input.CancelResponsePayload
+	if len(cancelResponsePayload) == 0 {
+		cancelResponsePayload = []byte("{}")
+	}
+
+	const query = `
+UPDATE payments
+SET status = $2,
+	provider_request_id = NULLIF($3, ''),
+	provider_txn_id = NULLIF($4, ''),
+	terminal_tid = $5,
+	provider_status_code = NULLIF($6, ''),
+	provider_status_message = NULLIF($7, ''),
+	provider_txn_status = NULLIF($8, ''),
+	provider_txn_message = NULLIF($9, ''),
+	cancel_response_payload = $10::jsonb,
+	updated_at = $11
+FROM bills b
+WHERE payments.id = $1
+  AND payments.bill_id = $12
+  AND b.id = payments.bill_id
+  AND b.tenant_id = $13
+  AND b.store_id = $14
+  AND payments.payment_method = 'ONLINE'`
+
+	result, err := tx.ExecContext(
+		ctx,
+		query,
+		input.PaymentID,
+		input.Status,
+		input.ProviderRequestID,
+		input.ProviderTxnID,
+		input.TerminalTID,
+		input.ProviderStatusCode,
+		input.ProviderStatusMessage,
+		input.ProviderTxnStatus,
+		input.ProviderTxnMessage,
+		string(cancelResponsePayload),
+		input.UpdatedAt,
+		input.BillID,
+		tenantID,
+		storeID,
+	)
+	if err != nil {
+		return internalError("Failed to update HDFC cancellation result", err)
+	}
+	if err := requireExactlyOneRow(result, "HDFC cancellation result update"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Repo) recomputeBillPaymentState(ctx context.Context, runner queryer, billID string, updatedAt time.Time) error {

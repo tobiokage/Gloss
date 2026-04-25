@@ -43,6 +43,34 @@ func (s *Service) RecordBillCreated(
 	})
 }
 
+func (s *Service) RecordBillCancelled(
+	ctx context.Context,
+	tenantID string,
+	storeID string,
+	billID string,
+	performedByUserID string,
+	metadata map[string]any,
+) error {
+	tenantID = strings.TrimSpace(tenantID)
+	storeID = strings.TrimSpace(storeID)
+	billID = strings.TrimSpace(billID)
+	performedByUserID = strings.TrimSpace(performedByUserID)
+
+	if tenantID == "" || billID == "" {
+		return apperrors.New(apperrors.CodeInternalError, "Invalid audit log input")
+	}
+
+	return s.repo.Insert(ctx, RecordInput{
+		TenantID:          tenantID,
+		StoreID:           storeID,
+		EntityType:        "BILL",
+		EntityID:          billID,
+		Action:            "BILL_CANCELLED",
+		PerformedByUserID: performedByUserID,
+		Metadata:          metadata,
+	})
+}
+
 func (s *Service) RecordPaymentEvent(
 	ctx context.Context,
 	tenantID string,

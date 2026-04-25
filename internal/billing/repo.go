@@ -500,6 +500,169 @@ func (r *Repo) GetBillGraph(ctx context.Context, billID string, tenantID string,
 	return graph, nil
 }
 
+func (r *Repo) LockBillForStore(
+	ctx context.Context,
+	tx *sql.Tx,
+	billID string,
+	tenantID string,
+	storeID string,
+) (BillRecord, error) {
+	const query = `
+SELECT
+	id::text,
+	bill_number,
+	status,
+	payment_mode_summary,
+	service_gross_amount,
+	discount_amount,
+	service_net_amount,
+	tip_amount,
+	taxable_base_amount,
+	tax_amount,
+	total_amount,
+	amount_paid,
+	amount_due,
+	created_at,
+	paid_at
+FROM bills
+WHERE id = $1
+  AND tenant_id = $2
+  AND store_id = $3
+FOR UPDATE`
+
+	var (
+		bill   BillRecord
+		paidAt sql.NullTime
+	)
+	err := tx.QueryRowContext(ctx, query, billID, tenantID, storeID).Scan(
+		&bill.ID,
+		&bill.BillNumber,
+		&bill.Status,
+		&bill.PaymentModeSummary,
+		&bill.ServiceGrossAmount,
+		&bill.DiscountAmount,
+		&bill.ServiceNetAmount,
+		&bill.TipAmount,
+		&bill.TaxableBaseAmount,
+		&bill.TaxAmount,
+		&bill.TotalAmount,
+		&bill.AmountPaid,
+		&bill.AmountDue,
+		&bill.CreatedAt,
+		&paidAt,
+	)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return BillRecord{}, apperrors.New(apperrors.CodeNotFound, "Bill not found")
+		}
+		return BillRecord{}, apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to lock bill",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+	if paidAt.Valid {
+		paidAtValue := paidAt.Time
+		bill.PaidAt = &paidAtValue
+	}
+	return bill, nil
+}
+
+func (r *Repo) HasActivePendingOnlinePayment(ctx context.Context, tx *sql.Tx, billID string) (bool, error) {
+	const query = `
+SELECT EXISTS (
+	SELECT 1
+	FROM payments
+	WHERE bill_id = $1
+	  AND payment_method = 'ONLINE'
+	  AND gateway = 'HDFC'
+	  AND status IN ('INITIATED', 'PENDING')
+)`
+
+	var exists bool
+	if err := tx.QueryRowContext(ctx, query, billID).Scan(&exists); err != nil {
+		return false, apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to check active online payment",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+	return exists, nil
+}
+
+func (r *Repo) CancelBill(
+	ctx context.Context,
+	tx *sql.Tx,
+	billID string,
+	cancelledByUserID string,
+	reason string,
+	cancelledAt time.Time,
+) error {
+	const query = `
+UPDATE bills
+SET status = 'CANCELLED',
+	cancellation_reason = $2,
+	cancelled_at = $3,
+	cancelled_by_user_id = $4
+WHERE id = $1
+  AND status <> 'CANCELLED'`
+
+	result, err := tx.ExecContext(ctx, query, billID, reason, cancelledAt, cancelledByUserID)
+	if err != nil {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to cancel bill",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to verify bill cancellation",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+	if rowsAffected != 1 {
+		return apperrors.New(apperrors.CodeInvalidRequest, "Bill is already cancelled")
+	}
+	return nil
+}
+
+func (r *Repo) MarkBillOnlineRetryInitiated(ctx context.Context, tx *sql.Tx, billID string) error {
+	const query = `
+UPDATE bills
+SET status = CASE
+	WHEN payment_mode_summary = 'ONLINE' THEN 'PAYMENT_PENDING'
+	WHEN payment_mode_summary = 'SPLIT' THEN 'PARTIALLY_PAID'
+	ELSE status
+END
+WHERE id = $1
+  AND payment_mode_summary IN ('ONLINE', 'SPLIT')
+  AND status IN ('PAYMENT_FAILED', 'PAYMENT_PENDING', 'PARTIALLY_PAID')`
+
+	result, err := tx.ExecContext(ctx, query, billID)
+	if err != nil {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to mark bill online retry initiated",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInternalError,
+			"Failed to verify bill online retry state",
+			map[string]any{"reason": err.Error()},
+		)
+	}
+	if rowsAffected != 1 {
+		return apperrors.New(apperrors.CodeInvalidRequest, "Bill is not eligible for online payment retry")
+	}
+	return nil
+}
+
 func (r *Repo) getBillHeader(ctx context.Context, billID string, tenantID string, storeID string) (BillGraph, error) {
 	const query = `
 SELECT

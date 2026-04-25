@@ -320,9 +320,102 @@ func TestCreateBillRequestDecodeRejectsGatewayField(t *testing.T) {
 	}
 }
 
+func TestRetryOnlinePaymentRejectsCancelledBillWithoutHDFCCall(t *testing.T) {
+	state := newBillingServiceTestState()
+	billID := "44444444-4444-4444-8444-444444444444"
+	state.addStoredBill(billID, string(enums.BillStatusCancelled), string(PaymentModeOnline), 0, 10500)
+	db := openBillingServiceTestDB(t, state)
+	coordinator := &billingTestOnlinePaymentCoordinator{state: state}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		&billingTestAuditRecorder{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	_, err := service.RetryOnlinePayment(context.Background(), billingTestAuthContext(), billID, RetryOnlinePaymentRequest{
+		IdempotencyKey: "retry-cancelled",
+	})
+	if err == nil {
+		t.Fatal("expected cancelled bill retry to fail")
+	}
+	if coordinator.initiateCalls != 0 {
+		t.Fatalf("cancelled bill retry must not call HDFC initiation, got %d calls", coordinator.initiateCalls)
+	}
+	if state.paymentInsertCount != 0 {
+		t.Fatalf("cancelled bill retry must not insert payment rows, got %d", state.paymentInsertCount)
+	}
+	if state.bills[billID].Status != string(enums.BillStatusCancelled) {
+		t.Fatalf("cancelled bill status changed to %q", state.bills[billID].Status)
+	}
+}
+
+func TestMarkBillOnlineRetryInitiatedRejectsCancelledBill(t *testing.T) {
+	state := newBillingServiceTestState()
+	billID := "55555555-5555-4555-8555-555555555555"
+	state.addStoredBill(billID, string(enums.BillStatusCancelled), string(PaymentModeOnline), 0, 10500)
+	db := openBillingServiceTestDB(t, state)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	err = NewRepo(db).MarkBillOnlineRetryInitiated(context.Background(), tx, billID)
+	if err == nil {
+		t.Fatal("expected cancelled bill retry state update to fail")
+	}
+	if state.bills[billID].Status != string(enums.BillStatusCancelled) {
+		t.Fatalf("cancelled bill status changed to %q", state.bills[billID].Status)
+	}
+}
+
+func TestRetryOnlinePaymentAuditsCommittedRetryBeforeHDFCFailure(t *testing.T) {
+	state := newBillingServiceTestState()
+	billID := "66666666-6666-4666-8666-666666666666"
+	state.addStoredBill(billID, string(enums.BillStatusPaymentFailed), string(PaymentModeOnline), 0, 10500)
+	db := openBillingServiceTestDB(t, state)
+	auditRecorder := &billingTestAuditRecorder{}
+	coordinator := &billingTestOnlinePaymentCoordinator{
+		state:       state,
+		initiateErr: errors.New("hdfc unavailable"),
+	}
+	service := NewService(
+		db,
+		NewRepo(db),
+		idempotency.NewStore(),
+		auditRecorder,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		coordinator,
+	)
+
+	_, err := service.RetryOnlinePayment(context.Background(), billingTestAuthContext(), billID, RetryOnlinePaymentRequest{
+		IdempotencyKey: "retry-audit-before-hdfc-failure",
+	})
+	if err == nil {
+		t.Fatal("expected HDFC initiation failure")
+	}
+	if state.paymentInsertCount != 1 {
+		t.Fatalf("expected one committed retry payment row, got %d", state.paymentInsertCount)
+	}
+	if coordinator.initiateCalls != 1 {
+		t.Fatalf("expected one HDFC initiation attempt, got %d", coordinator.initiateCalls)
+	}
+	if auditRecorder.paymentEventCalls != 1 {
+		t.Fatalf("expected retry audit after commit, got %d calls", auditRecorder.paymentEventCalls)
+	}
+	if auditRecorder.lastPaymentAction != "PAYMENT_RETRY_INITIATED" {
+		t.Fatalf("unexpected payment audit action %q", auditRecorder.lastPaymentAction)
+	}
+}
+
 type billingTestAuditRecorder struct {
-	calls int
-	err   error
+	calls             int
+	paymentEventCalls int
+	lastPaymentAction string
+	err               error
 }
 
 type billingTestOnlinePaymentCoordinator struct {
@@ -363,6 +456,20 @@ func (r *billingTestAuditRecorder) RecordBillCreated(
 	_ map[string]any,
 ) error {
 	r.calls++
+	return r.err
+}
+
+func (r *billingTestAuditRecorder) RecordPaymentEvent(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ string,
+	_ string,
+	action string,
+	_ map[string]any,
+) error {
+	r.paymentEventCalls++
+	r.lastPaymentAction = action
 	return r.err
 }
 
@@ -418,6 +525,32 @@ func newBillingServiceTestState() *billingServiceTestState {
 		billItems:        map[string][]BillItemRecord{},
 		tipAllocations:   map[string][]BillTipAllocationRecord{},
 		payments:         map[string][]BillPaymentRecord{},
+	}
+}
+
+func (s *billingServiceTestState) addStoredBill(
+	billID string,
+	status string,
+	paymentMode string,
+	amountPaid int64,
+	amountDue int64,
+) {
+	totalAmount := amountPaid + amountDue
+	s.bills[billID] = billingServiceStoredBill{
+		BillRecord: BillRecord{
+			ID:                 billID,
+			BillNumber:         "MSS-000999",
+			Status:             status,
+			PaymentModeSummary: paymentMode,
+			ServiceGrossAmount: totalAmount,
+			ServiceNetAmount:   totalAmount,
+			TotalAmount:        totalAmount,
+			AmountPaid:         amountPaid,
+			AmountDue:          amountDue,
+			CreatedAt:          time.Now().UTC(),
+		},
+		TenantID: s.store.TenantID,
+		StoreID:  s.store.ID,
 	}
 }
 
@@ -549,6 +682,8 @@ func (s *billingServiceTestState) exec(query string, args []any) (driver.Result,
 		return driver.RowsAffected(1), nil
 	case strings.Contains(normalized, "insert into payments"):
 		return s.execInsertPayment(args)
+	case strings.HasPrefix(normalized, "update bills set status = case"):
+		return s.execMarkBillOnlineRetryInitiated(args)
 	case strings.Contains(normalized, "update idempotency_keys"):
 		return s.execCompleteIdempotency(args)
 	default:
@@ -561,6 +696,10 @@ func (s *billingServiceTestState) query(query string, args []any) (driver.Rows, 
 	defer s.mu.Unlock()
 
 	switch normalized := billingServiceTestNormalizeQuery(query); {
+	case strings.HasPrefix(normalized, "select exists"):
+		return s.queryHasActivePendingOnlinePayment(args)
+	case strings.HasPrefix(normalized, "select id::text, bill_number, status"):
+		return s.queryBillLock(args)
 	case strings.Contains(normalized, "from bills b"):
 		return s.queryBillHeader(args)
 	case strings.Contains(normalized, "from idempotency_keys"):
@@ -675,6 +814,26 @@ func (s *billingServiceTestState) execCompleteIdempotency(args []any) (driver.Re
 	return driver.RowsAffected(1), nil
 }
 
+func (s *billingServiceTestState) execMarkBillOnlineRetryInitiated(args []any) (driver.Result, error) {
+	billID := billingServiceTestString(args[0])
+	bill, exists := s.bills[billID]
+	if !exists {
+		return driver.RowsAffected(0), nil
+	}
+	switch {
+	case bill.PaymentModeSummary == string(PaymentModeOnline) &&
+		(bill.Status == string(enums.BillStatusPaymentFailed) || bill.Status == string(enums.BillStatusPaymentPending) || bill.Status == string(enums.BillStatusPartiallyPaid)):
+		bill.Status = string(enums.BillStatusPaymentPending)
+	case bill.PaymentModeSummary == string(PaymentModeSplit) &&
+		(bill.Status == string(enums.BillStatusPaymentFailed) || bill.Status == string(enums.BillStatusPaymentPending) || bill.Status == string(enums.BillStatusPartiallyPaid)):
+		bill.Status = string(enums.BillStatusPartiallyPaid)
+	default:
+		return driver.RowsAffected(0), nil
+	}
+	s.bills[billID] = bill
+	return driver.RowsAffected(1), nil
+}
+
 func (s *billingServiceTestState) queryIdempotency(args []any) (driver.Rows, error) {
 	key := billingServiceTestCompositeKey(args[0], args[1], args[2])
 	record, exists := s.idempotency[key]
@@ -695,6 +854,67 @@ func (s *billingServiceTestState) queryIdempotency(args []any) (driver.Rows, err
 			record.RequestHash,
 			record.Status,
 			responseBillID,
+		}},
+	}, nil
+}
+
+func (s *billingServiceTestState) queryHasActivePendingOnlinePayment(args []any) (driver.Rows, error) {
+	billID := billingServiceTestString(args[0])
+	active := false
+	for _, payment := range s.payments[billID] {
+		if payment.PaymentMethod != string(PaymentModeOnline) || payment.Gateway == nil || *payment.Gateway != "HDFC" {
+			continue
+		}
+		if payment.Status == string(enums.PaymentStatusInitiated) || payment.Status == string(enums.PaymentStatusPending) {
+			active = true
+			break
+		}
+	}
+	return &billingServiceTestRows{
+		columns: []string{"exists"},
+		values:  [][]driver.Value{{active}},
+	}, nil
+}
+
+func (s *billingServiceTestState) queryBillLock(args []any) (driver.Rows, error) {
+	billID := billingServiceTestString(args[0])
+	bill, exists := s.bills[billID]
+	if !exists || bill.TenantID != billingServiceTestString(args[1]) || bill.StoreID != billingServiceTestString(args[2]) {
+		return &billingServiceTestRows{
+			columns: []string{
+				"id", "bill_number", "status", "payment_mode_summary", "service_gross_amount",
+				"discount_amount", "service_net_amount", "tip_amount", "taxable_base_amount",
+				"tax_amount", "total_amount", "amount_paid", "amount_due", "created_at", "paid_at",
+			},
+		}, nil
+	}
+
+	var paidAt any
+	if bill.PaidAt != nil {
+		paidAt = *bill.PaidAt
+	}
+	return &billingServiceTestRows{
+		columns: []string{
+			"id", "bill_number", "status", "payment_mode_summary", "service_gross_amount",
+			"discount_amount", "service_net_amount", "tip_amount", "taxable_base_amount",
+			"tax_amount", "total_amount", "amount_paid", "amount_due", "created_at", "paid_at",
+		},
+		values: [][]driver.Value{{
+			bill.ID,
+			bill.BillNumber,
+			bill.Status,
+			bill.PaymentModeSummary,
+			bill.ServiceGrossAmount,
+			bill.DiscountAmount,
+			bill.ServiceNetAmount,
+			bill.TipAmount,
+			bill.TaxableBaseAmount,
+			bill.TaxAmount,
+			bill.TotalAmount,
+			bill.AmountPaid,
+			bill.AmountDue,
+			bill.CreatedAt,
+			paidAt,
 		}},
 	}, nil
 }

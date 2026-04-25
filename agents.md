@@ -24,8 +24,11 @@ This file is implementation-first. It is not a marketing document.
 Treat these as the source of truth:
 - `salon_billing_hld.md`
 - `salon_billing_backend_only_lld.md`
+- `BonusHub_ECR_API_Integration_V2.2.pdf` for the HDFC payment module
 
 If code and docs disagree, align code to the docs unless a later approved change updates the design.
+
+For the payment module, if there is any conflict in API shape, request fields, response fields, status handling, or transport behavior, the HDFC integration guide takes precedence.
 
 ---
 
@@ -36,10 +39,11 @@ Build a backend for a multi-tenant salon billing system with:
 - store-scoped operations for managers
 - admin CRUD for catalogue and staff
 - bill creation with backend-owned money calculation
-- cash, UPI, and split cash + UPI payment modes
-- dynamic QR through Paytm and HDFC
-- webhook-first payment confirmation with status fallback
+- cash, online, and split cash + online payment modes
+- HDFC terminal-driven online payment integration
+- Status API-based payment confirmation
 - bill cancellation
+- provider-side payment-attempt cancellation
 - bill list and summary analytics
 - minimal audit logging
 - PostgreSQL as the only source of truth
@@ -56,14 +60,14 @@ Implement only these backend capabilities:
 - create bill
 - get bill
 - cancel bill
-- initiate UPI
-- retry failed or pending-due UPI remainder
-- payment webhooks
-- payment status fallback check
+- initiate online payment through HDFC
+- retry failed or pending-due online remainder
+- provider-side payment-attempt cancellation through HDFC
+- HDFC payment status synchronization
 - bills list
 - analytics summary
 - audit logging
-- idempotency for create bill and retry UPI
+- idempotency for create bill and retry online payment
 
 ---
 
@@ -84,7 +88,16 @@ Do not build any of these unless the design is explicitly changed:
 - multi-user billing workflow inside one store
 - server-side PDF generation
 - Redis as a required dependency
-- background workflow engine 
+- background workflow engine
+- Paytm implementation
+- payment webhooks
+- backend-generated QR for HDFC
+- HDFC Void Sale
+- Bank EMI
+- Brand EMI
+- Cash@Pos
+- UPI Collect
+- terminal tip support
 
 ---
 
@@ -104,11 +117,17 @@ These are not open for redesign during implementation:
 - Tip allocations default to empty when tip is zero
 - Tip is non-taxable
 - Commission is 10% of line net after discount
-- UPI uses **dynamic QR**
-- Gateways are **Paytm + HDFC**
-- Payment confirmation is **webhook-first + status fallback**
-- Retry creates a new UPI payment row only for outstanding due amount
-- Idempotency is required for create bill and retry UPI
+- Store-facing digital payment label is **ONLINE**
+- HDFC terminal owns customer interaction and QR generation
+- HDFC is the only active payment integration in the current implementation
+- Payment confirmation is **Status API only**
+- HDFC integration uses only Sale API, Transaction Status API, and Cancel Sale API
+- HDFC `tid` is mandatory and store-scoped
+- HDFC `mobileNo` is not part of the current request mapping
+- Backend stores the actual completion mode returned by HDFC
+- Retry creates a new online payment row only for outstanding due amount
+- Idempotency is required for create bill and retry online payment
+- Bill cancellation and provider-side payment-attempt cancellation are different operations
 - No external gateway call may happen inside a DB transaction
 - No optional abstraction layers
 
@@ -132,6 +151,7 @@ internal/
   staff/
   billing/
   payments/
+    hdfc/
   analytics/
   audit/
   platform/
@@ -152,7 +172,7 @@ Allowed direction:
 - `handler -> service`
 - `service -> repo, shared, platform, narrow interfaces`
 - `repo -> platform/db, models`
-- `payments/providers -> external gateway API`
+- `payments/hdfc -> external gateway API`
 
 Not allowed:
 - handler calling repo directly
@@ -180,12 +200,13 @@ Not allowed:
 - Do not build generalized rule engines
 - Do not introduce multi-store manager support in v1
 - Do not add versioned bootstrap snapshots yet
+- Do not preserve multi-gateway scaffolding while only HDFC is in scope
 
 ### SOLID
 - **S**: each module owns one clear business area
-- **O**: add new payment gateway by implementing provider interface, not by rewriting billing
-- **L**: provider implementations must satisfy the same contract and normalized outputs
-- **I**: use small interfaces at service boundaries
+- **O**: extend payment behavior later by isolating HDFC-specific code inside `payments`, not by rewriting billing
+- **L**: payment orchestration must preserve the same billing and payment-state guarantees everywhere
+- **I**: use small interfaces at service boundaries; do not add provider interfaces without a current implementation need
 - **D**: services depend on interfaces where replacement is useful; do not over-interface internal helper code without a concrete need
 
 ---
@@ -215,20 +236,24 @@ Not allowed:
 - Bill-level discount is allocated across lines proportionally using largest remainder
 
 ### Payment Rules
-- `CASH`, `UPI`, `SPLIT` only
-- Split means `cash + UPI` only
+- `CASH`, `ONLINE`, `SPLIT` only
+- Split means `cash + online` only
 - For split, `cash_amount > 0` and `cash_amount < total_amount`
-- Only one active pending UPI leg at a time
-- Retry creates a new UPI leg for the remaining due amount only
-- Old failed payment rows remain immutable for history
+- Only one active pending online leg at a time
+- Retry creates a new online leg for the remaining due amount only
+- Old failed or cancelled payment rows remain immutable for history
 - Payment success is backend-confirmed only
+- HDFC terminal owns the customer-facing payment flow
+- Backend never generates or returns HDFC QR payload
+- Provider-side payment-attempt cancellation is separate from bill cancellation
 
 ### Bill State Rules
 - Cash-only create flow ends as `PAID`
-- UPI-only ends as `PAYMENT_PENDING` until confirmed, or `PAYMENT_FAILED`
+- Online-only ends as `PAYMENT_PENDING` until confirmed, or `PAYMENT_FAILED`
 - Split starts as `PARTIALLY_PAID`
 - Cancellation updates state and metadata only
 - Cancellation does not recompute historical totals
+- Bill with an active pending HDFC payment attempt must not be bill-cancelled until the payment attempt is resolved or provider-cancelled
 
 ### Invariants
 - sum of line discounts = bill discount
@@ -250,6 +275,7 @@ Not allowed:
 - keep response and error shapes consistent
 - log important state changes and gateway outcomes
 - preserve immutability for money history rows
+- keep HDFC request and response handling aligned to the integration guide
 
 ### Never Do
 - do not redesign the architecture while implementing a milestone
@@ -257,7 +283,8 @@ Not allowed:
 - do not call payment gateways before bill/payment rows are committed
 - do not compute prices from client-supplied values
 - do not mutate old payment rows to represent retries
-- do not silently swallow webhook verification errors
+- do not add webhook code for the HDFC payment module
+- do not add Paytm scaffolding in the current implementation pass
 - do not add optional infra because it “may help later”
 
 ### When Unsure
@@ -443,6 +470,7 @@ Support tablet cache refresh with one clean store bootstrap API.
 - active catalogue items
 - active staff
 - active staff-store mappings if needed by tablet workflow
+- payment capability metadata needed by the current store workflow
 
 ## Rules
 - store manager gets only their store snapshot
@@ -583,7 +611,7 @@ Build the core money logic before wiring the create bill endpoint.
 
 ## Done Criteria
 - calculator can produce a complete bill draft result from validated input and authoritative catalogue/staff data
-- all invariants hold for representative cases: no discount, discount, no tip, split tip, cash, UPI, split
+- all invariants hold for representative cases: no discount, discount, no tip, split tip, cash, online, split
 - code is deterministic and side-effect free
 
 ---
@@ -591,7 +619,7 @@ Build the core money logic before wiring the create bill endpoint.
 # Milestone 8 — Create Bill API for Cash and Shared Persistence Path
 
 ## Goal
-Implement the full create-bill persistence path first, then use the same foundation for UPI and split.
+Implement the full create-bill persistence path first, then use the same foundation for online and split.
 
 ## Build
 - create bill handler
@@ -617,7 +645,7 @@ Implement the full create-bill persistence path first, then use the same foundat
 
 ## First Delivery Scope Inside This Milestone
 1. support `CASH` fully end-to-end first
-2. keep the service path generic enough that UPI and split can reuse the same persistence path
+2. keep the service path generic enough that online and split can reuse the same persistence path
 
 ## Required Transaction Steps
 - claim/check idempotency
@@ -649,19 +677,19 @@ Implement the full create-bill persistence path first, then use the same foundat
 
 ---
 
-# Milestone 9 — Payments Module and Dynamic QR Initiation
+# Milestone 9 — HDFC Payment Module and Sale Initiation
 
 ## Goal
-Add UPI and split flows without contaminating billing logic.
+Add online and split flows without contaminating billing logic.
 
 ## Build
-- payment provider interface
+- HDFC client
+- HDFC crypto helper
 - normalized payment DTOs/models
-- Paytm adapter
-- HDFC adapter
+- HDFC request/response mapping
 - payment initiation service
-- payment repo updates for QR metadata and payment status
-- UPI and split create-bill post-commit flow
+- payment repo updates for HDFC metadata and payment status
+- online and split create-bill post-commit flow
 - audit rows for payment initiated / payment failed
 
 ## Files
@@ -670,46 +698,49 @@ Add UPI and split flows without contaminating billing logic.
 - `internal/payments/repo.go`
 - `internal/payments/models.go`
 - `internal/payments/dto.go`
-- `internal/payments/webhook.go`
 - `internal/payments/mapper.go`
-- `internal/payments/providers/provider.go`
-- `internal/payments/providers/paytm.go`
-- `internal/payments/providers/hdfc.go`
+- `internal/payments/hdfc/client.go`
+- `internal/payments/hdfc/crypto.go`
+- `internal/payments/hdfc/types.go`
+- `internal/payments/hdfc/mapper.go`
 
-## Provider Interface
+## HDFC Integration Contract
 Support:
-- create dynamic QR
-- get payment status
-- verify webhook
-- parse webhook
+- create sale
+- get transaction status
+- cancel sale
 
 ## Create Bill Behavior Added in This Milestone
-- UPI-only bill:
+- online-only bill:
   - persist bill + payment rows in transaction
   - commit
-  - call selected gateway
-  - update payment row to `PENDING` with gateway refs and QR payload
+  - call HDFC Sale API
+  - update payment row to `PENDING` with HDFC refs and provider metadata
 - Split bill:
-  - persist cash leg + UPI leg in transaction
+  - persist cash leg + online leg in transaction
   - commit
-  - call gateway for UPI leg only
+  - call HDFC Sale API for online leg only
   - bill remains `PARTIALLY_PAID`
 
 ## Failure Rules
-- if QR creation fails:
-  - payment row becomes `FAILED`
-  - UPI-only bill becomes `PAYMENT_FAILED`
+- if HDFC sale initiation fails:
+  - payment row becomes `FAILED` only when the failure is unambiguous
+  - online-only bill becomes `PAYMENT_FAILED` when no amount is settled
   - split bill remains `PARTIALLY_PAID`
+- if create-sale is ambiguous:
+  - do not create a second payment row
+  - do not silently regenerate a new `saleTxnId`
 
 ## Done Criteria
-- create bill supports `CASH`, `UPI`, `SPLIT`
-- gateway call happens only after commit
-- payment row stores gateway metadata cleanly
-- billing module knows nothing about gateway-specific request/response details
+- create bill supports `CASH`, `ONLINE`, `SPLIT`
+- HDFC call happens only after commit
+- payment row stores HDFC metadata cleanly
+- billing module knows nothing about HDFC-specific request/response details
+- backend does not generate or return HDFC QR payload
 
 ---
 
-# Milestone 10 — Bill Read, Cancel, and Retry UPI
+# Milestone 10 — Bill Read, Cancel, Retry Online, and Cancel Payment Attempt
 
 ## Goal
 Complete the store-facing bill lifecycle APIs.
@@ -717,69 +748,78 @@ Complete the store-facing bill lifecycle APIs.
 ## Build
 - get bill endpoint
 - cancel bill endpoint
-- retry-upi endpoint
+- retry-online endpoint
+- payment-attempt cancel endpoint
 - retry idempotency path
 - payment-leg response mapping
-- audit rows for bill cancelled and payment retry initiated
+- audit rows for bill cancelled, payment retry initiated, and payment-attempt cancellation
 
 ## Endpoints
 - `GET /bills/{bill_id}`
 - `POST /bills/{bill_id}/cancel`
-- `POST /bills/{bill_id}/payments/retry-upi`
+- `POST /bills/{bill_id}/payments/retry-online`
+- `POST /bills/{bill_id}/payments/{payment_id}/cancel-attempt`
 
 ## Get Bill Must Return
 - bill header
 - bill items
 - tip allocations
 - payment legs
-- active UPI payload if pending
+- active online payment context if pending
 - receipt payload
 
 ## Cancel Rules
 - reason required
 - bill must be in cancellable state
+- bill must not have an active pending HDFC payment attempt
 - cancellation updates status and metadata only
 - historical amounts do not change
 
 ## Retry Rules
 - bill must belong to current store
 - amount due must be greater than zero
-- no active pending UPI leg may already exist
+- no active pending online leg may already exist
 - new payment row is inserted with `INITIATED`
-- gateway call occurs after commit
-- old failed rows remain unchanged
+- HDFC call occurs after commit
+- old failed or cancelled rows remain unchanged
+
+## Payment-Attempt Cancel Rules
+- payment must belong to current store bill
+- payment must be HDFC-backed
+- payment must still be provider-cancellable
+- stored provider transaction id is required
+- HDFC cancel call occurs outside DB transaction
+- provider-side payment cancellation updates payment and bill payment state only
 
 ## Done Criteria
 - store manager can read current bill state cleanly
 - cancellation is immediate and auditable
-- retry creates exactly one new UPI leg for outstanding due amount
+- retry creates exactly one new online leg for outstanding due amount
+- payment-attempt cancellation cleanly updates payment and bill payment state
 - duplicate retry request with same idempotency key does not duplicate payment rows
 
 ---
 
-# Milestone 11 — Webhooks and Status Fallback
+# Milestone 11 — HDFC Status Synchronization
 
 ## Goal
 Make payment confirmation reliable and backend-authoritative.
 
 ## Build
-- `POST /webhooks/paytm`
-- `POST /webhooks/hdfc`
-- webhook verification and parsing
-- normalized webhook event mapping
-- payment row lookup by gateway identifiers
+- HDFC status synchronization logic
+- payment row lookup by HDFC identifiers
 - lock payment row and related bill row
 - recompute bill `amount_paid`, `amount_due`, `status`
-- persist verified gateway payloads
-- optional status fallback trigger from `GET /bills/{bill_id}` when payment is stale/pending
-- audit rows for payment success / failure
+- persist provider status payloads
+- optional status sync trigger from `GET /bills/{bill_id}` when payment is stale/pending
+- audit rows for payment success / failure / cancellation
 
 ## Rules
-- verification failure returns failure response and logs securely
-- duplicate webhooks must be safe
+- Status API is the primary confirmation path
+- no webhook path exists in this implementation
+- repeated status checks must be safe
 - updates must be idempotent at payment row level
-- webhook path owns settlement updates, not the tablet client
-- status fallback is a read-triggered safety path, not the primary path
+- status sync path owns settlement updates, not the tablet client
 
 ## Required Transaction Steps
 - find target payment row
@@ -787,14 +827,14 @@ Make payment confirmation reliable and backend-authoritative.
 - lock related bill row
 - update payment status
 - recompute bill amounts and state
-- save verified metadata
+- save provider metadata
 - commit
 
 ## Done Criteria
 - successful payment settles bill correctly
-- delayed webhook can be recovered through status fallback
-- duplicate or reordered provider callbacks do not corrupt bill totals
+- repeated or delayed status checks do not corrupt bill totals
 - payment truth is backend-confirmed only
+- actual completion mode returned by HDFC is stored
 
 ---
 
@@ -865,7 +905,7 @@ Make the system safe to ship without expanding scope.
 - final transaction boundary review
 - structured logs for key money and payment events
 - DB timeout / context usage review
-- gateway timeout and retry policy review at adapter level
+- HDFC timeout and retry policy review at adapter level
 - production-safe config validation
 - seed cleanup for non-production environments
 - API examples / collection for store app and admin app teams
@@ -873,12 +913,13 @@ Make the system safe to ship without expanding scope.
 ## Review Checklist
 - every money value is paise
 - every write path is tenant-safe and store-safe
-- every gateway call happens after commit
+- every HDFC call happens after commit
 - idempotency exists where required
 - payment rows remain historical and immutable enough for audit
 - cancellation preserves historical totals
 - no unused abstractions slipped in
 - no module reaches across boundaries improperly
+- no webhook code or Paytm scaffolding slipped into the implementation
 
 ## Done Criteria
 - backend is deployable as one service with one PostgreSQL database
@@ -898,7 +939,8 @@ Make the system safe to ship without expanding scope.
 - `POST /bills`
 - `GET /bills/{bill_id}`
 - `POST /bills/{bill_id}/cancel`
-- `POST /bills/{bill_id}/payments/retry-upi`
+- `POST /bills/{bill_id}/payments/retry-online`
+- `POST /bills/{bill_id}/payments/{payment_id}/cancel-attempt`
 
 ### Admin
 - `GET /admin/catalogue`
@@ -912,10 +954,6 @@ Make the system safe to ship without expanding scope.
 - mapping endpoint for staff to store
 - `GET /admin/bills`
 - `GET /admin/analytics/summary`
-
-### Webhooks
-- `POST /webhooks/paytm`
-- `POST /webhooks/hdfc`
 
 ---
 
@@ -937,7 +975,7 @@ Use soft deactivation. Keep mapping validation explicit.
 This is the core module. Keep calculator pure. Keep service authoritative. Keep repo explicit.
 
 ### Payments
-Payment adapter boundary must stay clean. Normalize provider outputs immediately.
+Keep the payment module HDFC-only in the current implementation. Keep terminal-owned flow assumptions inside `payments`. Normalize HDFC outputs immediately. Do not add webhook code or Paytm scaffolding.
 
 ### Analytics
 Read-only. Avoid premature aggregation systems.
@@ -955,7 +993,7 @@ Good code in this backend has these properties:
 - a service that owns the transaction and business rules
 - a repo that performs explicit persistence operations
 - a calculator that is deterministic and side-effect free
-- a payment provider adapter that hides gateway-specific details
+- a payment module that hides HDFC-specific transport and crypto details from billing
 - no speculative architecture
 
 ---
@@ -985,7 +1023,7 @@ When choosing between two implementations, prefer the one that:
 
 -------
 
-Code Review rules - 
+Code Review rules -
 
 Check cross-module boundaries, not just milestone-local correctness.
 
