@@ -25,6 +25,8 @@ func NewRouter(
 	adminStaffCreateHandler nethttp.HandlerFunc,
 	adminStaffDeactivateHandler nethttp.HandlerFunc,
 	adminStaffAssignStoreHandler nethttp.HandlerFunc,
+	adminBillsListHandler nethttp.HandlerFunc,
+	adminAnalyticsSummaryHandler nethttp.HandlerFunc,
 ) *chi.Mux {
 	router := chi.NewRouter()
 
@@ -47,6 +49,8 @@ func NewRouter(
 	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/staff", adminStaffCreateHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/staff/{id}/deactivate", adminStaffDeactivateHandler)
 	router.With(authMiddleware, superAdminOnlyMiddleware).Post("/admin/staff/{id}/stores/{store_id}", adminStaffAssignStoreHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/bills", adminBillsListHandler)
+	router.With(authMiddleware, superAdminOnlyMiddleware).Get("/admin/analytics/summary", adminAnalyticsSummaryHandler)
 
 	return router
 }

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"gloss/internal/analytics"
 	"gloss/internal/audit"
 	"gloss/internal/auth"
 	"gloss/internal/billing"
@@ -70,6 +71,9 @@ func main() {
 	staffRepo := staff.NewRepo(db)
 	staffService := staff.NewService(staffRepo)
 	staffHandler := staff.NewHandler(staffService)
+	analyticsRepo := analytics.NewRepo(db)
+	analyticsService := analytics.NewService(analyticsRepo)
+	analyticsHandler := analytics.NewHandler(analyticsService)
 	authMiddleware := auth.Middleware(cfg)
 	superAdminOnlyMiddleware := func(next nethttp.Handler) nethttp.Handler {
 		return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
@@ -123,6 +127,8 @@ func main() {
 		staffHandler.CreateStaff,
 		staffHandler.DeactivateStaff,
 		staffHandler.AssignStaffToStore,
+		analyticsHandler.ListAdminBills,
+		analyticsHandler.GetAdminAnalyticsSummary,
 	)
 
 	server := &nethttp.Server{
