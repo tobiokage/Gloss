@@ -541,6 +541,15 @@ func (s *Service) CancelBill(
 		return CreateBillResponse{}, err
 	}
 
+	s.logger.Info(
+		"bill cancelled",
+		"bill_id", billID,
+		"bill_number", cancelledBill.BillNumber,
+		"tenant_id", scope.TenantID,
+		"store_id", scope.StoreID,
+		"user_id", scope.UserID,
+	)
+
 	if recorder, ok := s.auditRecorder.(billCancelledAuditRecorder); ok {
 		if err := recorder.RecordBillCancelled(
 			ctx,
@@ -665,6 +674,15 @@ func (s *Service) RetryOnlinePayment(
 	}
 
 	if created {
+		s.logger.Info(
+			"retry online payment initiated",
+			"bill_id", billID,
+			"payment_id", paymentID,
+			"tenant_id", scope.TenantID,
+			"store_id", scope.StoreID,
+			"user_id", scope.UserID,
+			"idempotency_key", idempotencyKey,
+		)
 		if recorder, ok := s.auditRecorder.(paymentEventAuditRecorder); ok {
 			if err := recorder.RecordPaymentEvent(
 				ctx,
@@ -683,6 +701,14 @@ func (s *Service) RetryOnlinePayment(
 			}
 		}
 		if err := s.payments.InitiateBillOnlinePayment(ctx, scope.TenantID, scope.StoreID, billID, paymentID, scope.UserID); err != nil {
+			s.logger.Error(
+				"retry online payment initiation failed after commit",
+				"bill_id", billID,
+				"payment_id", paymentID,
+				"tenant_id", scope.TenantID,
+				"store_id", scope.StoreID,
+				"error", err,
+			)
 			return CreateBillResponse{}, err
 		}
 	}

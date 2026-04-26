@@ -1,9 +1,12 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	apperrors "gloss/internal/shared/errors"
@@ -173,6 +176,16 @@ func validateRequired(cfg Config) error {
 		}
 	}
 
+	if err := validateAuthConfig(cfg); err != nil {
+		return err
+	}
+	if err := validateHDFCConfig(cfg); err != nil {
+		return err
+	}
+	if err := validateProductionDBConfig(cfg); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -182,4 +195,117 @@ func getEnvOrDefault(key string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func validateAuthConfig(cfg Config) error {
+	if !isProductionEnv(cfg.AppEnv) {
+		return nil
+	}
+
+	secret := strings.TrimSpace(cfg.Auth.JWTSecret)
+	if len(secret) < 32 {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"JWT_SECRET must be at least 32 characters in production",
+			map[string]any{"field": "JWT_SECRET"},
+		)
+	}
+
+	if isKnownWeakSecret(secret) {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"JWT_SECRET must not use a weak or placeholder value in production",
+			map[string]any{"field": "JWT_SECRET"},
+		)
+	}
+
+	return nil
+}
+
+func validateHDFCConfig(cfg Config) error {
+	parsed, err := url.ParseRequestURI(cfg.HDFC.BaseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"HDFC_BASE_URL must be a valid absolute URL",
+			map[string]any{"field": "HDFC_BASE_URL"},
+		)
+	}
+
+	secretBytes, err := hex.DecodeString(cfg.HDFC.ClientSecretKeyHex)
+	if err != nil || len(secretBytes) != 32 {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"HDFC_CLIENT_SECRET_KEY must be 64 hex characters",
+			map[string]any{"field": "HDFC_CLIENT_SECRET_KEY"},
+		)
+	}
+
+	if len([]byte(cfg.HDFC.IV)) != 16 {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"HDFC_IV must be 16 bytes",
+			map[string]any{"field": "HDFC_IV"},
+		)
+	}
+
+	if !isProductionEnv(cfg.AppEnv) {
+		return nil
+	}
+
+	parsed, err = url.Parse(cfg.HDFC.BaseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"HDFC_BASE_URL must be a valid absolute URL",
+			map[string]any{"field": "HDFC_BASE_URL"},
+		)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasSuffix(host, ".localhost") {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"HDFC_BASE_URL must not point to localhost in production",
+			map[string]any{"field": "HDFC_BASE_URL"},
+		)
+	}
+	if host == "example.com" || strings.HasSuffix(host, ".example.com") {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"HDFC_BASE_URL must not use an example host in production",
+			map[string]any{"field": "HDFC_BASE_URL"},
+		)
+	}
+
+	return nil
+}
+
+func validateProductionDBConfig(cfg Config) error {
+	if !isProductionEnv(cfg.AppEnv) {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.DB.SSLMode), "disable") {
+		return apperrors.NewWithDetails(
+			apperrors.CodeInvalidConfig,
+			"DB_SSLMODE must not be disable in production",
+			map[string]any{"field": "DB_SSLMODE"},
+		)
+	}
+	return nil
+}
+
+func isProductionEnv(appEnv string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(appEnv))
+	return normalized == "production" || normalized == "prod"
+}
+
+func isKnownWeakSecret(secret string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(secret))
+	switch normalized {
+	case "secret", "changeme", "change-me", "password", "jwt_secret", "jwt-secret",
+		"dev-secret", "test-secret", "development-secret":
+		return true
+	default:
+		return false
+	}
 }

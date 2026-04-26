@@ -34,3 +34,5 @@
 go run ./cmd/migrate -command up
 go run ./cmd/api
 ```
+
+Dev seed data is not part of the production migration path. For local demo data, apply `schema/postgres/seeds/dev_seed.sql` explicitly after migrations.

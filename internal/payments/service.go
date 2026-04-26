@@ -209,6 +209,16 @@ func (s *Service) CancelBillOnlinePaymentAttempt(
 		return err
 	}
 
+	s.logger.Info(
+		"HDFC payment attempt cancellation requested",
+		"tenant_id", tenantID,
+		"store_id", storeID,
+		"bill_id", billID,
+		"payment_id", paymentID,
+		"provider_request_id", payment.ProviderRequestID,
+		"provider_txn_id", payment.ProviderTxnID,
+	)
+
 	response, err := cancelClient.CancelSale(ctx, hdfc.CancelSaleRequest{
 		TID:       payment.TerminalTID,
 		BHTxnID:   payment.ProviderTxnID,
@@ -230,6 +240,16 @@ func (s *Service) CancelBillOnlinePaymentAttempt(
 
 	confirmedCancelled := strings.TrimSpace(response.TxnStatus) == hdfc.TxnStatusCanceled
 	if !confirmedCancelled {
+		s.logger.Error(
+			"HDFC cancel sale did not confirm cancellation",
+			"tenant_id", tenantID,
+			"store_id", storeID,
+			"bill_id", billID,
+			"payment_id", paymentID,
+			"provider_request_id", payment.ProviderRequestID,
+			"provider_txn_id", payment.ProviderTxnID,
+			"provider_txn_status", response.TxnStatus,
+		)
 		return apperrors.New(apperrors.CodeInvalidRequest, "HDFC did not confirm payment-attempt cancellation")
 	}
 
@@ -248,6 +268,16 @@ func (s *Service) CancelBillOnlinePaymentAttempt(
 		CancelResponsePayload: response.RawPayload,
 		UpdatedAt:             updatedAt,
 	}); err != nil {
+		s.logger.Error(
+			"failed to persist HDFC payment attempt cancellation",
+			"tenant_id", tenantID,
+			"store_id", storeID,
+			"bill_id", billID,
+			"payment_id", paymentID,
+			"provider_request_id", payment.ProviderRequestID,
+			"provider_txn_id", payment.ProviderTxnID,
+			"error", err,
+		)
 		return err
 	}
 
@@ -288,6 +318,16 @@ func (s *Service) SyncPendingBillPaymentStatus(
 	if !ok || statusClient == nil {
 		return apperrors.New(apperrors.CodeInternalError, "HDFC payment status client is not configured")
 	}
+
+	s.logger.Info(
+		"HDFC status sync requested",
+		"tenant_id", tenantID,
+		"store_id", storeID,
+		"bill_id", billID,
+		"payment_id", payment.ID,
+		"provider_request_id", payment.ProviderRequestID,
+		"provider_txn_id", payment.ProviderTxnID,
+	)
 
 	response, err := statusClient.GetTransactionStatus(ctx, hdfc.TransactionStatusRequest{
 		TID:       payment.TerminalTID,
@@ -338,6 +378,17 @@ func (s *Service) SyncPendingBillPaymentStatus(
 		UpdatedAt:             checkedAt,
 	})
 	if err != nil {
+		s.logger.Error(
+			"failed to persist HDFC status sync result",
+			"tenant_id", tenantID,
+			"store_id", storeID,
+			"bill_id", billID,
+			"payment_id", payment.ID,
+			"provider_request_id", payment.ProviderRequestID,
+			"provider_txn_id", payment.ProviderTxnID,
+			"payment_status", normalizedStatus,
+			"error", err,
+		)
 		return err
 	}
 
